@@ -14,9 +14,10 @@ gs_installer.exe
 __pycache__/
 *.pyc
 
-# Environment / secrets
+# Environment / secrets (build machine only — never commit)
 .env*
 !.env.example
+*.local.ps1
 
 # Logs
 *.log
