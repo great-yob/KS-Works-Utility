@@ -83,12 +83,13 @@ async function createWindow() {
 
     const win = new BrowserWindow({
       width: 944,
-      height: 688,
+      height: 880,
       frame: false,
       transparent: true,
-      resizable: true,
-      minWidth: 944,
-      minHeight: 688,
+      resizable: false,
+      maximizable: false,
+      fullscreenable: false,
+      center: true,
       autoHideMenuBar: true,
       webPreferences: {
         nodeIntegration: false,

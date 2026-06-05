@@ -3,6 +3,7 @@ import { X, Minus } from "lucide-react";
 import { modules } from "./modules/registry";
 import type { AccentColor } from "./modules/types";
 import UpdateNotice from "./components/UpdateNotice";
+import logo from "./assets/logo.png";
 
 // Routes derived from the registry. useRoutes (vs <Routes>) is the idiomatic way
 // to drive routing from a data array and avoids per-<Route> key typing issues.
@@ -52,10 +53,12 @@ export default function App() {
         {/* Sidebar (LNB) */}
         <div className="w-64 bg-white/[0.02] border-r border-white/5 backdrop-blur-3xl flex flex-col pt-8 pb-4 relative z-50">
           <div className="px-6 mb-10 draggable">
-            <h1 className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-indigo-300">
-              KS-Works
-            </h1>
-            <p className="text-xs text-slate-500 mt-1">Utility Portal</p>
+            <img
+              src={logo}
+              alt="utility"
+              draggable={false}
+              className="w-40 select-none pointer-events-none"
+            />
           </div>
 
           {/* Navigation — driven entirely by the module registry */}
@@ -84,7 +87,8 @@ export default function App() {
           <UpdateNotice />
 
           <div className="px-6 mt-auto">
-            <div className="text-[10px] text-slate-600 font-mono">v{__APP_VERSION__}</div>
+            <div className="text-[11px] text-slate-500">© kim daekyung</div>
+            <div className="text-[10px] text-slate-600 font-mono mt-1">version {__APP_VERSION__}</div>
           </div>
         </div>
 

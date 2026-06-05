@@ -200,27 +200,6 @@ export default function ImageConverter() {
           <div>
             <h3 className="text-white/40 text-[10px] font-bold uppercase tracking-widest mb-4 flex items-center gap-2">
               <Settings className="w-3.5 h-3.5 text-indigo-400" />
-              포함시킬 파일 옵션
-            </h3>
-            <div className="flex gap-4">
-              <label className="flex items-center gap-2 text-slate-300 text-sm cursor-pointer">
-                <input type="checkbox" checked={options.jpg} onChange={e => setOptions({...options, jpg: e.target.checked})} className="accent-indigo-500" />
-                jpg/jpeg 포함
-              </label>
-              <label className="flex items-center gap-2 text-slate-300 text-sm cursor-pointer">
-                <input type="checkbox" checked={options.bmp} onChange={e => setOptions({...options, bmp: e.target.checked})} className="accent-indigo-500" />
-                bmp 포함
-              </label>
-              <label className="flex items-center gap-2 text-slate-300 text-sm cursor-pointer">
-                <input type="checkbox" checked={options.emf} onChange={e => setOptions({...options, emf: e.target.checked})} className="accent-indigo-500" />
-                emf 포함
-              </label>
-            </div>
-          </div>
-
-          <div>
-            <h3 className="text-white/40 text-[10px] font-bold uppercase tracking-widest mb-4 flex items-center gap-2">
-              <Settings className="w-3.5 h-3.5 text-indigo-400" />
               출력 설정
             </h3>
             
@@ -257,6 +236,27 @@ export default function ImageConverter() {
                 />
               </button>
               <span className="text-sm text-slate-300">확장자를 대문자(.JPEG)로 저장</span>
+            </div>
+          </div>
+
+          <div>
+            <h3 className="text-white/40 text-[10px] font-bold uppercase tracking-widest mb-4 flex items-center gap-2">
+              <Settings className="w-3.5 h-3.5 text-indigo-400" />
+              포함시킬 파일 옵션
+            </h3>
+            <div className="flex gap-4">
+              <label className="flex items-center gap-2 text-slate-300 text-sm cursor-pointer">
+                <input type="checkbox" checked={options.jpg} onChange={e => setOptions({...options, jpg: e.target.checked})} className="accent-indigo-500" />
+                jpg/jpeg 포함
+              </label>
+              <label className="flex items-center gap-2 text-slate-300 text-sm cursor-pointer">
+                <input type="checkbox" checked={options.bmp} onChange={e => setOptions({...options, bmp: e.target.checked})} className="accent-indigo-500" />
+                bmp 포함
+              </label>
+              <label className="flex items-center gap-2 text-slate-300 text-sm cursor-pointer">
+                <input type="checkbox" checked={options.emf} onChange={e => setOptions({...options, emf: e.target.checked})} className="accent-indigo-500" />
+                emf 포함
+              </label>
             </div>
           </div>
         </div>
