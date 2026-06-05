@@ -1,6 +1,26 @@
 import { app, BrowserWindow, ipcMain } from 'electron';
 import path from 'path';
+import os from 'os';
+import fs from 'fs';
 import { autoUpdater } from 'electron-updater';
+
+// Append-only diagnostic log for auto-update events (handy for support/QA).
+// Lives in userData (e.g. %APPDATA%\ks-works-utility\ksworks-update.log) once the
+// app is ready, falling back to the OS temp dir before then.
+function updateLogPath(): string {
+  try {
+    return path.join(app.getPath('userData'), 'ksworks-update.log');
+  } catch {
+    return path.join(os.tmpdir(), 'ksworks-update.log');
+  }
+}
+function logUpdate(line: string) {
+  try {
+    fs.appendFileSync(updateLogPath(), `[${new Date().toISOString()}] ${line}\n`);
+  } catch {
+    /* logging must never crash the app */
+  }
+}
 
 // Force production environment in Electron so Vite dev server isn't started
 process.env.NODE_ENV = 'production';
@@ -23,17 +43,24 @@ function setupAutoUpdater(win: BrowserWindow) {
   // Download in the background; if the user never clicks "재시작", install on quit.
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;
+  // Capture electron-updater's internal logs to the diagnostic file too.
+  autoUpdater.logger = {
+    info: (m?: any) => logUpdate('[info] ' + m),
+    warn: (m?: any) => logUpdate('[warn] ' + m),
+    error: (m?: any) => logUpdate('[error] ' + m),
+  };
+  logUpdate(`updater started, current version=${app.getVersion()} packaged=${app.isPackaged}`);
 
   const send = (payload: Record<string, unknown>) => {
     if (!win.isDestroyed()) win.webContents.send('update:status', payload);
   };
 
-  autoUpdater.on('checking-for-update', () => send({ state: 'checking' }));
-  autoUpdater.on('update-available', (info) => send({ state: 'available', version: info.version }));
-  autoUpdater.on('update-not-available', () => send({ state: 'none' }));
+  autoUpdater.on('checking-for-update', () => { logUpdate('checking-for-update'); send({ state: 'checking' }); });
+  autoUpdater.on('update-available', (info) => { logUpdate('update-available ' + info.version); send({ state: 'available', version: info.version }); });
+  autoUpdater.on('update-not-available', () => { logUpdate('update-not-available'); send({ state: 'none' }); });
   autoUpdater.on('download-progress', (p) => send({ state: 'downloading', percent: Math.round(p.percent) }));
-  autoUpdater.on('update-downloaded', (info) => send({ state: 'downloaded', version: info.version }));
-  autoUpdater.on('error', (err) => send({ state: 'error', message: String(err?.message || err) }));
+  autoUpdater.on('update-downloaded', (info) => { logUpdate('update-downloaded ' + info.version); send({ state: 'downloaded', version: info.version }); });
+  autoUpdater.on('error', (err) => { logUpdate('error ' + String(err?.message || err)); send({ state: 'error', message: String(err?.message || err) }); });
 
   // Renderer-initiated actions.
   ipcMain.handle('update:check', () => autoUpdater.checkForUpdates().catch((e) => {

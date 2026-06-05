@@ -20,7 +20,7 @@ npm run lint             # type-check only (tsc --noEmit); there is no separate 
 npm run build            # vite build (frontend → dist/) + esbuild bundles server/electron-main/preload → dist/*.cjs
 npm start                # run the built server standalone (node dist/server.cjs), no Electron
 npm run dev:electron     # build, then launch Electron pointing at dist/electron-main.cjs
-npm run build:exe        # build, then electron-builder → NSIS installer in release/
+npm run build:exe        # build, then electron-builder → NSIS installer in release_build/
 npm run release          # build, then electron-builder --publish always (uploads to GitHub Releases; needs GH_TOKEN)
 ```
 

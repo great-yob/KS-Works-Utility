@@ -1,7 +1,7 @@
 {
   "name": "ks-works-utility",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.0.2",
   "description": "KS-Works 사내 유틸리티 포털 (PDF 압축 / 이미지 변환)",
   "author": "great-yob",
   "type": "module",
@@ -52,7 +52,7 @@
     "appId": "com.ksworks.utility",
     "productName": "KS-Works-Utility",
     "directories": {
-      "output": "release"
+      "output": "release_build"
     },
     "files": [
       "dist/**/*",
@@ -71,7 +71,8 @@
       {
         "provider": "github",
         "owner": "great-yob",
-        "repo": "KS-Works-Utility"
+        "repo": "KS-Works-Utility",
+        "releaseType": "release"
       }
     ],
     "win": {
