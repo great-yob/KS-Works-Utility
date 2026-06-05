@@ -28,3 +28,6 @@ npm-debug.log*
 Thumbs.db
 .claude/settings.local.json
 .antigravity/
+
+# Design sources (원본 디자인 파일 — 빌드에는 assets/icon.ico 사용)
+소스/
