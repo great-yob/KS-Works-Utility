@@ -68,7 +68,7 @@
     "publish": [
       {
         "provider": "github",
-        "owner": "__GITHUB_OWNER__",
+        "owner": "great-yob",
         "repo": "KS-Works-Utility"
       }
     ],
