@@ -53,12 +53,13 @@ Key endpoints:
 - `POST /api/image/convert` — legacy single-file upload fallback path.
 - `GET /api/download/:filename` — serves a temp file once, then deletes it (with a directory-traversal guard against `tempDir`).
 - `POST /api/close` / `POST /api/minimize` — window controls; `minimize` dynamically `require("electron")` so the server still runs as plain Node.
+- `POST /api/open-folder` — opens a folder in Windows Explorer (`spawn("explorer.exe", [path])`); used by the green "폴더 열기" result buttons.
 
 All temp work happens in `os.tmpdir()/pdf-compressor-temp`. Upload/body limits are 500 MB.
 
 ### 2. Electron shell (`electron-main.ts` + `preload.ts`)
 
-- Frameless, transparent `BrowserWindow` (944×688). Window dragging is done with CSS `-webkit-app-region: drag` (`.draggable` / `.no-drag` in `src/index.css`), not native chrome.
+- Frameless, transparent, **non-resizable** `BrowserWindow` (944×704, centered). The app root has rounded corners (`rounded-2xl`) and a global `brightness-125`. Window dragging is done with CSS `-webkit-app-region: drag` (`.draggable` / `.no-drag` in `src/index.css`), not native chrome.
 - Forces `NODE_ENV=production` and raises the V8 heap to 8 GB for large PDFs.
 - `preload.ts` exposes **`window.electronAPI.getPathForFile(file)`** (Electron `webUtils`). This is load-bearing: it gives the renderer the **absolute path** of dropped files, which is how the app reads originals in place and writes results next to them.
 
@@ -72,13 +73,13 @@ Both `getGhostscriptPath()` and the worker-path logic detect packaging by checki
 
 ### Frontend (`src/`)
 
-Vite + React 19 + React Router + Tailwind v4 + `motion` + `lucide-react`. Pages live in `src/pages/`; both talk to the server purely over `fetch` to relative `/api/*` URLs.
+Vite + React 19 + React Router + Tailwind v4 + `lucide-react`. Pages live in `src/pages/`; both talk to the server purely over `fetch` to relative `/api/*` URLs. Each page is a 4-panel layout (sidebar + 옵션 / 파일드롭 / 진행및결과), where the file-drop and progress-result panels are stacked vertically and the progress-result panel has a terminal-style log window; every panel has its own reset button. (`motion` is still a dependency but no longer imported by the pages.)
 
 **Portal module convention (how to add a utility)**: the sidebar + routing in `src/App.tsx` are data-driven from `src/modules/registry.tsx` (one `UtilityModule` entry per utility — `id`/`path`/`label`/`icon`/`accent`/`Component`). Routing uses `useRoutes`. The backend mirror is `api-modules/registry.ts`: each `ApiModule` exposes a `register(app)` that mounts its `/api/*` routes, mounted by `registerModules(app)` in `server.ts`. Shared backend helpers (`tempDir`, multer `upload`, `getResourcePath`/`getGhostscriptPath`/`getImageWorkerPath`) live in `api-modules/shared.ts`. The original `/api/compress` and `/api/image/*` endpoints still live inline in `server.ts`. Full checklist: `docs/유틸리티_추가_가이드.md`.
 
-**Auto-update**: packaged builds use NSIS (per-user, `oneClick`) and `electron-updater` against GitHub Releases. `electron-main.ts` `setupAutoUpdater()` checks on launch + every 6h, auto-downloads, and pushes status over the `update:status` IPC channel; `preload.ts` exposes `onUpdateStatus`/`checkForUpdate`/`installUpdate`, surfaced by `src/components/UpdateNotice.tsx`. Set `build.publish[0].owner` (currently `__GITHUB_OWNER__`) and bump `version` per release. Full steps: `docs/자동업데이트_배포_가이드.md`. The app version shown in the sidebar comes from the Vite `__APP_VERSION__` define (single source = `package.json`).
+**Auto-update**: packaged builds use NSIS (per-user, `oneClick`) and `electron-updater` against GitHub Releases (`great-yob/KS-Works-Utility`, public repo). `electron-main.ts` `setupAutoUpdater()` checks on launch + every 6h, auto-downloads, logs events to `userData/ksworks-update.log`, and pushes status over the `update:status` IPC channel; `preload.ts` exposes `onUpdateStatus`/`checkForUpdate`/`installUpdate`, surfaced by `src/components/UpdateNotice.tsx`. Publishing config: `build.publish[0].releaseType` is `release` (releases go live immediately, no draft step), `build.nsis.artifactName` is fixed to `KS-Works-Utility-Setup.exe` so the latest installer is always at the stable `/releases/latest/download/KS-Works-Utility-Setup.exe` URL, and `build.directories.output` is `release_build/`. App icon = `assets/icon.ico`. Bump `version` per release. Full steps: `docs/자동업데이트_배포_가이드.md`. The sidebar version comes from the Vite `__APP_VERSION__` define (single source = `package.json`).
 
-**Direct-save vs download behavior**: the renderer sends the file's absolute path (from `electronAPI.getPathForFile`) as `originalPath`. When present, the server writes the result *beside the original* (prefixed `압축_` / `변환_`) and reports `savedDirectly: true`; the UI then skips the browser download. Without a path (plain browser context), it falls back to the `/api/download/:id` flow.
+**Result output / "폴더 열기"**: the renderer sends dropped files' absolute paths (from `electronAPI.getPathForFile`). PDF compress writes the result *beside the original* as `압축_<name>.pdf` and reports `savedDirectly: true`; image batch-convert writes JPGs into a `converted_jpg` subfolder next to the source files. Each utility's result panel has a green "폴더 열기" button that calls `/api/open-folder` on that output folder. The legacy `/api/image/convert` (single-file) and `/api/download/:id` (browser-download) paths still exist as fallbacks for non-Electron contexts.
 
 ### Compression algorithm (`/api/compress`)
 
