@@ -1,7 +1,7 @@
 {
   "name": "ks-works-utility",
   "private": true,
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "KS-Works 사내 유틸리티 포털 (PDF 압축 / 이미지 변환)",
   "author": "great-yob",
   "type": "module",

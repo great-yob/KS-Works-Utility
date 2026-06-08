@@ -1,6 +1,5 @@
 import React, { useState, useRef, DragEvent } from "react";
-import { motion, AnimatePresence } from "motion/react";
-import { UploadCloud, FileText, Settings, Shield, Sliders, RefreshCw, Terminal, Download, AlertCircle, Info, FileUp, CheckCircle } from "lucide-react";
+import { FileText, Sliders, Terminal, AlertCircle, FileUp, CheckCircle, RotateCcw, FolderOpen } from "lucide-react";
 import { ActiveFileState, TargetOption } from "../types";
 
 const TARGET_OPTIONS: TargetOption[] = [
@@ -10,21 +9,26 @@ const TARGET_OPTIONS: TargetOption[] = [
   { id: "custom", label: "직접 입력", value: 15, badge: "목표 직접 지정" },
 ];
 
+const dirOf = (p: string) => {
+  const i = Math.max(p.lastIndexOf("\\"), p.lastIndexOf("/"));
+  return i >= 0 ? p.substring(0, i) : p;
+};
+
 export default function PdfCompressor() {
   const [targetSizeId, setTargetSizeId] = useState<string>("5mb");
   const [customSize, setCustomSize] = useState<string>("7");
   const [dragActive, setDragActive] = useState<boolean>(false);
+  const [savedFolder, setSavedFolder] = useState<string>("");
   const [fileState, setFileState] = useState<ActiveFileState>({
     file: null as any,
     name: "",
     size: 0,
     status: "idle",
   });
-  
+
   const [progress, setProgress] = useState<number>(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Determine current active target size in MB
   const getSelectedTargetSizeMB = (): number => {
     if (targetSizeId === "custom") {
       const parsed = parseFloat(customSize);
@@ -34,7 +38,6 @@ export default function PdfCompressor() {
     return option ? option.value : 5;
   };
 
-  // Simulated progress simulation for target limit iterative compiler
   React.useEffect(() => {
     if (fileState.status !== "compressing") {
       setProgress(0);
@@ -43,28 +46,24 @@ export default function PdfCompressor() {
 
     setProgress(0);
     let timer: NodeJS.Timeout;
-    
+
     const updateProgress = () => {
       setProgress((prev) => {
         if (prev < 30) {
-          return prev + Math.floor(Math.random() * 4) + 2; // Jump quickly to 30%
+          return prev + Math.floor(Math.random() * 4) + 2;
         } else if (prev < 70) {
-          return prev + Math.floor(Math.random() * 2) + 1; // Standard speed up to 70%
+          return prev + Math.floor(Math.random() * 2) + 1;
         } else if (prev < 95) {
-          return prev + (Math.random() > 0.65 ? 1 : 0); // slow down as it gets closer
+          return prev + (Math.random() > 0.65 ? 1 : 0);
         }
         return prev;
       });
-
       const nextDelay = Math.floor(Math.random() * 150) + 100;
       timer = setTimeout(updateProgress, nextDelay);
     };
 
     timer = setTimeout(updateProgress, 120);
-
-    return () => {
-      clearTimeout(timer);
-    };
+    return () => clearTimeout(timer);
   }, [fileState.status]);
 
   const handleDragOver = (e: DragEvent<HTMLDivElement>) => {
@@ -80,12 +79,8 @@ export default function PdfCompressor() {
   };
 
   const selectFile = (file: File) => {
-    setFileState({
-      file,
-      name: file.name,
-      size: file.size,
-      status: "selected",
-    });
+    setSavedFolder("");
+    setFileState({ file, name: file.name, size: file.size, status: "selected" });
   };
 
   const handleDrop = async (e: DragEvent<HTMLDivElement>) => {
@@ -118,38 +113,28 @@ export default function PdfCompressor() {
   const triggerCompression = async () => {
     const file = fileState.file;
     if (!file) return;
-    
-    setFileState(prev => ({
-      ...prev,
-      status: "compressing",
-    }));
+
+    setFileState((prev) => ({ ...prev, status: "compressing" }));
 
     const targetMB = getSelectedTargetSizeMB();
     const formData = new FormData();
     formData.append("targetSize", targetMB.toString());
-    
-    // Pass the absolute file path if running in Electron (append BEFORE file)
+
     let originalPath = "";
-    // @ts-ignore
     if (window.electronAPI) {
-      // @ts-ignore
       originalPath = window.electronAPI.getPathForFile(file);
-    } else if (file.path) {
-      // @ts-ignore
-      originalPath = file.path;
+    } else if ((file as any).path) {
+      originalPath = (file as any).path;
     }
-    
+
     if (originalPath) {
       formData.append("originalPath", originalPath);
     }
-    
+
     formData.append("file", file);
 
     try {
-      const response = await fetch("/api/compress", {
-        method: "POST",
-        body: formData,
-      });
+      const response = await fetch("/api/compress", { method: "POST", body: formData });
 
       if (!response.ok) {
         const errorData = await response.json();
@@ -159,24 +144,9 @@ export default function PdfCompressor() {
       const result = await response.json();
       if (result.success) {
         setProgress(100);
-        // Let user see 100% progress before transition
         await new Promise((resolve) => setTimeout(resolve, 600));
-        setFileState((prev) => ({
-          ...prev,
-          status: "success",
-          result: result,
-        }));
-        
-        // If it was saved directly by backend, we don't need to trigger download
-        if (!result.savedDirectly) {
-            const link = document.createElement("a");
-            // @ts-ignore
-            link.href = `/api/download/${result.downloadId}?filename=${encodeURIComponent(result.fileName)}`;
-            link.download = result.fileName;
-            document.body.appendChild(link);
-            link.click();
-            document.body.removeChild(link);
-        }
+        if (originalPath && result.savedDirectly) setSavedFolder(dirOf(originalPath));
+        setFileState((prev) => ({ ...prev, status: "success", result: result }));
       } else {
         throw new Error(result.error || "압축을 수행할 수 없습니다.");
       }
@@ -189,28 +159,39 @@ export default function PdfCompressor() {
     }
   };
 
-  const downloadCompressedFile = () => {
-    if (!fileState.result || !fileState.result.downloadId) return;
-    
-    const a = document.createElement("a");
-    // @ts-ignore
-    a.href = `/api/download/${fileState.result.downloadId}?filename=${encodeURIComponent(fileState.result.fileName)}`;
-    a.download = fileState.result.fileName || "compressed.pdf";
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+  const openFolderPath = async (folderPath: string) => {
+    if (!folderPath) return;
+    try {
+      await fetch("/api/open-folder", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: folderPath }),
+      });
+    } catch (e) {
+      console.error(e);
+    }
   };
 
-  const resetState = () => {
-    setFileState({
-      file: null as any,
-      name: "",
-      size: 0,
-      status: "idle",
-    });
-    if (fileInputRef.current) {
-      fileInputRef.current.value = "";
-    }
+  // --- Per-column resets ---
+  const resetOptions = () => {
+    setTargetSizeId("5mb");
+    setCustomSize("7");
+  };
+
+  const resetFiles = () => {
+    setSavedFolder("");
+    setFileState({ file: null as any, name: "", size: 0, status: "idle" });
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  };
+
+  const resetResult = () => {
+    setProgress(0);
+    setSavedFolder("");
+    setFileState((prev) =>
+      prev.file
+        ? { ...prev, status: "selected", result: undefined, errorMessage: undefined }
+        : { file: null as any, name: "", size: 0, status: "idle" }
+    );
   };
 
   const formatSize = (bytes: number): string => {
@@ -221,235 +202,200 @@ export default function PdfCompressor() {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
   };
 
+  const busy = fileState.status === "compressing";
+  const R = 34;
+  const C = 2 * Math.PI * R;
+
   return (
-    <div className="max-w-4xl mx-auto w-full space-y-6 relative z-10 flex-1 flex flex-col pt-4">
-      
-      {/* Target Size Selector */}
-      <div className="bg-black/20 p-6 border border-white/5 rounded-2xl">
-        <div className="space-y-6">
-          {/* Section Title */}
-          <div>
-            <h3 className="text-white/40 text-[10px] font-bold uppercase tracking-widest mb-4 flex items-center gap-2">
-              <Sliders className="w-3.5 h-3.5 text-blue-400" />
-              목표 파일 크기 설정
-            </h3>
-            
-            {/* Target Options Selector */}
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-              {TARGET_OPTIONS.map((option) => (
-                <button
-                  key={option.id}
-                  id={`target-opt-${option.id}`}
-                  onClick={() => setTargetSizeId(option.id)}
-                  disabled={fileState.status === "compressing"}
-                  className={`px-4 py-3 rounded-xl border transition-all duration-200 cursor-pointer ${
-                    targetSizeId === option.id
-                      ? "bg-blue-500/20 border-blue-400/30 text-blue-400 font-semibold shadow-md shadow-blue-500/15"
-                      : "bg-white/5 border-transparent hover:bg-white/10 text-slate-300 font-medium"
+    <div className="grid grid-cols-[3fr_7fr] gap-4 flex-1 min-h-0 relative z-10">
+
+      {/* ===== 옵션 ===== */}
+      <section className="bg-black/20 border border-white/5 rounded-2xl p-4 flex flex-col min-h-0">
+        <h3 className="text-white/40 text-[10px] font-bold uppercase tracking-widest mb-3 flex items-center gap-2 shrink-0">
+          <Sliders className="w-3.5 h-3.5 text-blue-400" /> 옵션
+        </h3>
+        <div className="flex-1 overflow-auto terminal-scroll pr-1 -mr-1">
+          <div className="grid grid-cols-1 gap-2">
+            {TARGET_OPTIONS.map((option) => (
+              <button
+                key={option.id}
+                id={`target-opt-${option.id}`}
+                onClick={() => setTargetSizeId(option.id)}
+                disabled={busy}
+                className={`px-3 py-2.5 rounded-xl border transition-all text-left no-drag disabled:opacity-50 ${targetSizeId === option.id
+                    ? "bg-blue-500/20 border-blue-400/30 text-blue-400 font-semibold shadow-md shadow-blue-500/15"
+                    : "bg-white/5 border-transparent hover:bg-white/10 text-slate-300 font-medium"
                   }`}
-                >
-                  <div className="text-left">
-                    <span className="block text-sm">{option.label}</span>
-                    <span className="text-[10px] opacity-70">{option.badge}</span>
-                  </div>
-                </button>
-              ))}
-            </div>
-
-            {/* Custom field rendering */}
-            <AnimatePresence>
-              {targetSizeId === "custom" && (
-                <motion.div
-                  initial={{ opacity: 0, height: 0 }}
-                  animate={{ opacity: 1, height: "auto" }}
-                  exit={{ opacity: 0, height: 0 }}
-                  transition={{ duration: 0.2 }}
-                  className="overflow-hidden"
-                >
-                  <div className="mt-3 bg-white/5 border border-white/10 p-3 rounded-xl flex items-center gap-3">
-                    <input
-                      id="custom-size-input"
-                      type="number"
-                      step="0.1"
-                      min="0.5"
-                      max="500"
-                      value={customSize}
-                      disabled={fileState.status === "compressing"}
-                      onChange={(e) => setCustomSize(e.target.value)}
-                      className="bg-black/40 border border-white/10 rounded-lg py-1.5 px-3 text-sm focus:outline-none focus:border-blue-400 text-blue-300 w-32"
-                      placeholder="용량 입력"
-                    />
-                    <span className="text-xs text-slate-400">MB 단위로 입력하세요</span>
-                  </div>
-                </motion.div>
-              )}
-            </AnimatePresence>
+              >
+                <span className="block text-sm">{option.label}</span>
+                <span className="text-[10px] opacity-70">{option.badge}</span>
+              </button>
+            ))}
           </div>
-        </div>
-      </div>
 
-      {/* Main Work Workbench */}
-      <div className="bg-white/5 border border-white/5 rounded-3xl p-8 flex-1">
-        <AnimatePresence mode="wait">
-          
-          {/* IDLE state view: Drop files */}
-          {fileState.status === "idle" && (
-            <motion.div
-              key="idle-view"
-              initial={{ opacity: 0, y: 12 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -12 }}
-              className="flex flex-col items-center justify-center min-h-[300px]"
-            >
+          {targetSizeId === "custom" && (
+            <div className="mt-2 bg-white/5 border border-white/10 p-3 rounded-xl">
+              <input
+                id="custom-size-input"
+                type="number"
+                step="0.1"
+                min="0.5"
+                max="500"
+                value={customSize}
+                disabled={busy}
+                onChange={(e) => setCustomSize(e.target.value)}
+                className="bg-black/40 border border-white/10 rounded-lg py-1.5 px-3 text-sm focus:outline-none focus:border-blue-400 text-blue-300 w-full no-drag"
+                placeholder="MB"
+              />
+              <span className="text-[10px] text-slate-400 mt-1 block">MB 단위로 입력</span>
+            </div>
+          )}
+        </div>
+        <button
+          onClick={resetOptions}
+          className="mt-3 shrink-0 w-full py-2 rounded-lg bg-white/5 hover:bg-white/10 text-slate-400 hover:text-slate-200 text-xs font-medium flex items-center justify-center gap-1.5 transition-colors no-drag"
+        >
+          <RotateCcw className="w-3 h-3" /> 옵션 초기화
+        </button>
+      </section>
+
+      {/* ===== Right: 파일(2) / 결과(3) ===== */}
+      <div className="grid grid-rows-[2fr_3fr] gap-4 min-h-0">
+
+        {/* ----- 파일 ----- */}
+        <section className="bg-white/[0.03] border border-white/5 rounded-2xl p-4 flex flex-col min-h-0">
+          <h3 className="text-white/40 text-[10px] font-bold uppercase tracking-widest mb-2 flex items-center gap-2 shrink-0">
+            <FileText className="w-3.5 h-3.5 text-blue-400" /> 파일
+          </h3>
+
+          <div className="flex-1 flex flex-col min-h-0">
+            {!fileState.file ? (
               <div
                 id="dropzone"
                 onDragOver={handleDragOver}
                 onDragLeave={handleDragLeave}
                 onDrop={handleDrop}
                 onClick={() => fileInputRef.current?.click()}
-                className={`w-full max-w-lg h-64 border-2 border-dashed rounded-3xl flex flex-col items-center justify-center transition-all duration-300 cursor-pointer ${
-                  dragActive
+                className={`flex-1 min-h-[70px] border-2 border-dashed rounded-2xl flex flex-col items-center justify-center text-center px-3 transition-all cursor-pointer no-drag ${dragActive
                     ? "border-blue-400 bg-blue-500/10"
                     : "border-white/10 hover:border-white/20 hover:bg-white/[0.03]"
-                }`}
+                  }`}
               >
-                <input
-                  id="file-input"
-                  type="file"
-                  ref={fileInputRef}
-                  onChange={handleFileChange}
-                  accept=".pdf,application/pdf"
-                  className="hidden"
-                />
-
-                <div className="w-16 h-16 rounded-full bg-blue-500/20 flex items-center justify-center mb-4">
-                  <FileUp className="w-8 h-8 text-blue-400" />
+                <input id="file-input" type="file" ref={fileInputRef} onChange={handleFileChange} accept=".pdf,application/pdf" className="hidden" />
+                <FileUp className="w-7 h-7 text-blue-400 mb-1.5" />
+                <p className="text-white text-xs font-medium">PDF 드래그 또는 클릭</p>
+                <p className="text-slate-500 text-[10px] mt-0.5">최대 500MB</p>
+              </div>
+            ) : (
+              <div className="flex-1 flex flex-col gap-2 min-h-0 justify-center">
+                <div className="flex items-center gap-2 bg-white/5 rounded-xl p-2.5 min-w-0">
+                  <FileText className="w-7 h-7 text-blue-400 shrink-0" />
+                  <div className="min-w-0 text-left">
+                    <p className="text-white text-xs font-semibold truncate">{fileState.name}</p>
+                    <p className="text-slate-400 text-[10px]">{formatSize(fileState.size)}</p>
+                  </div>
                 </div>
-
-                <p className="text-white font-medium">PDF 파일을 여기에 드래그하거나 클릭</p>
-                <p className="text-slate-500 text-xs mt-1">최대 500MB까지 지원</p>
+                {fileState.status === "selected" && (
+                  <button
+                    onClick={triggerCompression}
+                    className="w-full bg-amber-500 hover:bg-amber-400 text-slate-900 font-bold py-2.5 rounded-xl shadow-lg shadow-amber-900/30 transition-all active:scale-95 no-drag"
+                  >
+                    압축 시작
+                  </button>
+                )}
+                {fileState.status === "compressing" && (
+                  <p className="text-amber-400 text-xs text-center animate-pulse">압축 진행 중…</p>
+                )}
+                {fileState.status === "success" && (
+                  <p className="text-emerald-400 text-xs text-center flex items-center justify-center gap-1">
+                    <CheckCircle className="w-3.5 h-3.5" /> 완료
+                  </p>
+                )}
               </div>
-            </motion.div>
-          )}
+            )}
+          </div>
 
-          {/* SELECTED state view: Ready to compress */}
-          {fileState.status === "selected" && (
-            <motion.div
-              key="selected-view"
-              initial={{ opacity: 0, y: 10 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -10 }}
-              className="flex flex-col justify-center items-center min-h-[300px] text-center"
-            >
-              <div className="w-20 h-20 rounded-full bg-blue-500/20 flex items-center justify-center mb-6">
-                <FileText className="w-10 h-10 text-blue-400" />
+          <button
+            onClick={resetFiles}
+            disabled={busy}
+            className="mt-2 shrink-0 w-full py-2 rounded-lg bg-white/5 hover:bg-white/10 disabled:opacity-40 disabled:cursor-not-allowed text-slate-400 hover:text-slate-200 text-xs font-medium flex items-center justify-center gap-1.5 transition-colors no-drag"
+          >
+            <RotateCcw className="w-3 h-3" /> 파일 초기화
+          </button>
+        </section>
+
+        {/* ----- 진행 및 결과 ----- */}
+        <section className="bg-white/[0.03] border border-white/5 rounded-2xl p-4 flex flex-col min-h-0">
+          <h3 className="text-white/40 text-[10px] font-bold uppercase tracking-widest mb-2 flex items-center gap-2 shrink-0">
+            <Terminal className="w-3.5 h-3.5 text-blue-400" /> 진행 및 결과
+          </h3>
+
+          {/* status block (compact) */}
+          <div className="shrink-0 mb-3 flex items-center justify-center min-h-[64px]">
+            {fileState.status === "compressing" && (
+              <div className="flex items-center gap-4">
+                <div className="relative w-20 h-20">
+                  <svg className="w-full h-full transform -rotate-90">
+                    <circle cx="40" cy="40" r={R} className="stroke-white/10" strokeWidth="6" fill="transparent" />
+                    <circle cx="40" cy="40" r={R} className="stroke-amber-400" strokeWidth="6" fill="transparent" strokeDasharray={C} strokeDashoffset={C * (1 - progress / 100)} strokeLinecap="round" />
+                  </svg>
+                  <div className="absolute inset-0 flex items-center justify-center font-bold text-base">{progress}%</div>
+                </div>
+                <p className="text-amber-400 text-sm font-semibold animate-pulse">최적화 엔진 실행 중…</p>
               </div>
-              <h3 className="text-xl font-bold text-white mb-2">{fileState.name}</h3>
-              <p className="text-slate-400 text-sm mb-8">
-                원본 크기: {formatSize(fileState.size)}
+            )}
+            {fileState.status === "success" && fileState.result && (
+              <div className="flex flex-wrap items-center justify-center gap-2">
+                <span className="flex items-center gap-1 text-emerald-400 font-bold text-sm"><CheckCircle className="w-5 h-5" /> 압축 성공</span>
+                <span className="bg-white/5 px-2.5 py-1 rounded-lg text-xs text-slate-300">원본 {formatSize(fileState.result.originalSize)}</span>
+                <span className="bg-emerald-500/10 text-emerald-300 px-2.5 py-1 rounded-lg text-xs font-semibold">결과 {formatSize(fileState.result.compressedSize)}</span>
+              </div>
+            )}
+            {fileState.status === "error" && (
+              <div className="flex flex-col items-center gap-1 text-center">
+                <AlertCircle className="w-7 h-7 text-red-400" />
+                <p className="text-slate-400 text-xs px-2">{fileState.errorMessage}</p>
+              </div>
+            )}
+            {(fileState.status === "idle" || fileState.status === "selected") && (
+              <p className="text-slate-600 text-xs text-center px-2">
+                {fileState.status === "selected" ? "‘압축 시작’을 누르면 결과가 표시됩니다" : "파일을 추가하면 시작할 수 있습니다"}
               </p>
-              <button
-                onClick={triggerCompression}
-                className="bg-blue-600 hover:bg-blue-500 text-white font-bold py-4 px-12 rounded-2xl shadow-lg shadow-blue-900/50 transition-all active:scale-95"
-              >
-                압축 시작하기
-              </button>
-              <button
-                onClick={resetState}
-                className="mt-4 text-xs text-slate-500 hover:text-slate-300 transition-colors"
-              >
-                취소
-              </button>
-            </motion.div>
-          )}
+            )}
+          </div>
 
-          {/* COMPRESSING state view */}
-          {fileState.status === "compressing" && (
-            <motion.div
-              key="compressing-view"
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              className="flex flex-col justify-center items-center min-h-[300px] gap-8"
+          {/* log window */}
+          <div className="flex-1 min-h-0 bg-black/30 border border-white/5 rounded-xl p-3 overflow-auto terminal-scroll font-mono text-[11px] leading-relaxed">
+            {fileState.result?.logs && fileState.result.logs.length ? (
+              fileState.result.logs.map((l, i) => (
+                <div key={i} className="text-slate-300 whitespace-pre-wrap break-all">{l}</div>
+              ))
+            ) : (
+              <span className="text-slate-600">로그가 여기에 표시됩니다…</span>
+            )}
+          </div>
+
+          {/* actions */}
+          <div className="flex gap-2 mt-3 shrink-0">
+            {fileState.status === "success" && savedFolder && (
+              <button
+                onClick={() => openFolderPath(savedFolder)}
+                className="flex-1 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors no-drag"
+              >
+                <FolderOpen className="w-3.5 h-3.5" /> 폴더 열기
+              </button>
+            )}
+            <button
+              onClick={resetResult}
+              disabled={busy}
+              className="flex-1 py-2 rounded-lg bg-white/5 hover:bg-white/10 disabled:opacity-40 disabled:cursor-not-allowed text-slate-400 hover:text-slate-200 text-xs font-medium flex items-center justify-center gap-1.5 transition-colors no-drag"
             >
-              <div className="relative w-32 h-32">
-                 <svg className="w-full h-full transform -rotate-90">
-                    <circle cx="64" cy="64" r="58" className="stroke-white/10" strokeWidth="8" fill="transparent" />
-                    <circle cx="64" cy="64" r="58" className="stroke-blue-400" strokeWidth="8" fill="transparent" strokeDasharray={2 * Math.PI * 58} strokeDashoffset={2 * Math.PI * 58 * (1 - progress / 100)} strokeLinecap="round" />
-                 </svg>
-                 <div className="absolute inset-0 flex items-center justify-center font-bold text-2xl tracking-tighter">
-                   {progress}%
-                 </div>
-              </div>
-              <div className="text-center space-y-2">
-                <h3 className="text-white font-semibold animate-pulse">PDF 압축 최적화 엔진 실행 중...</h3>
-                <p className="text-slate-400 text-xs text-center max-w-xs leading-relaxed">복잡한 PDF 구조를 분석하고 리인코딩하는 중입니다. 잠시만 기다려주세요.</p>
-              </div>
-            </motion.div>
-          )}
+              <RotateCcw className="w-3 h-3" /> 결과 초기화
+            </button>
+          </div>
+        </section>
 
-          {/* SUCCESS view */}
-          {fileState.status === "success" && fileState.result && (
-            <motion.div
-              key="success-view"
-              initial={{ opacity: 0, y: 12 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0 }}
-              className="flex flex-col gap-8"
-            >
-              <div className="text-center space-y-2">
-                <div className="w-16 h-16 bg-emerald-500/20 rounded-full flex items-center justify-center mx-auto mb-4">
-                  <CheckCircle className="w-8 h-8 text-emerald-400" />
-                </div>
-                <h3 className="text-2xl font-bold text-white">압축 성공</h3>
-                <p className="text-slate-400">PDF 최적화 작업이 완료되었습니다.</p>
-              </div>
-
-              <div className="grid grid-cols-2 gap-4">
-                <div className="bg-white/5 p-4 rounded-xl text-center border border-white/5">
-                  <div className="text-slate-400 text-[10px] uppercase">원본</div>
-                  <div className="text-white font-bold">{formatSize(fileState.result.originalSize)}</div>
-                </div>
-                <div className="bg-emerald-500/10 p-4 rounded-xl text-center border border-emerald-500/20">
-                  <div className="text-emerald-400 text-[10px] uppercase">결과</div>
-                  <div className="text-emerald-300 font-bold">{formatSize(fileState.result.compressedSize)}</div>
-                </div>
-              </div>
-
-              <button
-                onClick={downloadCompressedFile}
-                className="w-full bg-blue-600 text-white py-4 rounded-xl font-bold flex items-center justify-center gap-2 hover:bg-blue-500 transition-colors"
-              >
-                <Download className="w-5 h-5" />
-                다운로드
-              </button>
-            </motion.div>
-          )}
-
-          {/* ERROR state view */}
-          {fileState.status === "error" && (
-            <motion.div
-              key="error-view"
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              className="flex flex-col items-center justify-center min-h-[300px] text-center"
-            >
-              <AlertCircle className="w-16 h-16 text-red-400 mb-4" />
-              <h3 className="text-xl font-bold text-red-400">오류 발생</h3>
-              <p className="text-slate-400 text-sm mt-2 max-w-sm">{fileState.errorMessage}</p>
-              <button
-                onClick={resetState}
-                className="mt-8 text-blue-400 underline text-sm"
-              >
-                다시 시도하기
-              </button>
-            </motion.div>
-          )}
-
-        </AnimatePresence>
       </div>
-
     </div>
   );
 }

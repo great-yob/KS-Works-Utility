@@ -43,7 +43,7 @@ const INACTIVE = "text-slate-400 hover:text-slate-200 hover:bg-white/[0.04]";
 export default function App() {
   return (
     <BrowserRouter>
-      <div className="min-h-screen bg-[#0f1115] text-slate-200 font-sans selection:bg-blue-500/30 overflow-hidden flex flex-row">
+      <div className="h-screen bg-[#13161d] text-slate-200 font-sans selection:bg-blue-500/30 overflow-hidden flex flex-row rounded-2xl brightness-125">
         {/* Dynamic Background */}
         <div className="fixed inset-0 pointer-events-none">
           <div className="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] rounded-full bg-blue-600/10 blur-[120px]" />
@@ -51,13 +51,13 @@ export default function App() {
         </div>
 
         {/* Sidebar (LNB) */}
-        <div className="w-64 bg-white/[0.02] border-r border-white/5 backdrop-blur-3xl flex flex-col pt-8 pb-4 relative z-50">
-          <div className="px-6 mb-10 draggable">
+        <div className="w-44 bg-white/[0.02] border-r border-white/5 backdrop-blur-3xl flex flex-col pt-8 pb-4 relative z-50">
+          <div className="px-4 mb-8 draggable">
             <img
               src={logo}
               alt="utility"
               draggable={false}
-              className="w-40 select-none pointer-events-none"
+              className="w-28 select-none pointer-events-none"
             />
           </div>
 
@@ -71,12 +71,12 @@ export default function App() {
                   to={mod.path}
                   end={mod.path === "/"}
                   className={({ isActive }) =>
-                    `flex items-center gap-3 px-4 py-3 rounded-xl transition-all duration-300 ${
+                    `flex items-center gap-2 px-3 py-3 rounded-xl transition-all duration-300 text-sm ${
                       isActive ? ACCENT_ACTIVE[mod.accent] : INACTIVE
                     }`
                   }
                 >
-                  <Icon className="w-5 h-5" />
+                  <Icon className="w-5 h-5 shrink-0" />
                   <span>{mod.label}</span>
                 </NavLink>
               );
@@ -86,7 +86,7 @@ export default function App() {
           {/* Auto-update status (visible only when an update is in progress) */}
           <UpdateNotice />
 
-          <div className="px-6 mt-auto">
+          <div className="px-4 mt-auto">
             <div className="text-[11px] text-slate-500">© kim daekyung</div>
             <div className="text-[10px] text-slate-600 font-mono mt-1">version {__APP_VERSION__}</div>
           </div>
@@ -115,8 +115,8 @@ export default function App() {
             </div>
           </div>
 
-          {/* Page Routing — also derived from the registry */}
-          <div className="flex-1 overflow-auto p-4 flex flex-col">
+          {/* Page Routing — pages render their own 3-column grid */}
+          <div className="flex-1 overflow-hidden p-4 flex flex-col">
             <PortalRoutes />
           </div>
         </div>

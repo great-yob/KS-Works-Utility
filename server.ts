@@ -403,6 +403,20 @@ app.post("/api/minimize", (req, res) => {
   }
 });
 
+// Open a folder in Windows Explorer (used by the "폴더 열기" result buttons)
+app.post("/api/open-folder", (req, res) => {
+  const folderPath = (req.body?.path || "").toString();
+  if (!folderPath || !fs.existsSync(folderPath)) {
+    return res.status(400).json({ error: "폴더를 찾을 수 없습니다." });
+  }
+  try {
+    spawn("explorer.exe", [folderPath], { detached: true }).unref();
+    res.json({ success: true });
+  } catch (e: any) {
+    res.status(500).json({ error: "폴더를 열 수 없습니다: " + e.message });
+  }
+});
+
 // Download endpoint for the compressed file
 app.get("/api/download/:filename", (req, res) => {
   const filename = req.params.filename;
