@@ -10,10 +10,14 @@ import multer from "multer";
 
 /** True when running inside a packaged Electron app (asar). */
 export function isPackaged(): boolean {
+  // In dev, server.ts runs via tsx as ESM where __dirname is undefined; guard it
+  // so path resolution falls back to process.cwd()/resources instead of throwing.
+  // Packaged builds are bundled to CJS by esbuild, so __dirname is defined there.
+  const dir = typeof __dirname !== "undefined" ? __dirname : "";
   return (
-    __dirname.includes("app.asar") ||
-    __dirname.includes("resources\\app") ||
-    __dirname.includes("resources/app")
+    dir.includes("app.asar") ||
+    dir.includes("resources\\app") ||
+    dir.includes("resources/app")
   );
 }
 
@@ -39,6 +43,11 @@ export function getGhostscriptPath(): string {
 /** Absolute path to the bundled Python image worker exe. */
 export function getImageWorkerPath(): string {
   return getResourcePath("image_worker", "image_worker.exe");
+}
+
+/** Absolute path to the bundled Python HWP worker exe. */
+export function getHwpWorkerPath(): string {
+  return getResourcePath("hwp_worker", "hwp_worker.exe");
 }
 
 /** Shared scratch directory for all utilities. Created on import. */

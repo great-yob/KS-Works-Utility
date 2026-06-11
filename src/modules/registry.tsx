@@ -1,6 +1,7 @@
-import { FileText, Image as ImageIcon } from "lucide-react";
+import { FileText, Image as ImageIcon, FileType } from "lucide-react";
 import PdfCompressor from "../pages/PdfCompressor";
 import ImageConverter from "../pages/ImageConverter";
+import HwpImageConverter from "../pages/HwpImageConverter";
 import type { UtilityModule } from "./types";
 
 /**
@@ -15,12 +16,12 @@ import type { UtilityModule } from "./types";
  */
 export const modules: UtilityModule[] = [
   {
-    id: "pdf-compressor",
+    id: "hwp-image-converter",
     path: "/",
-    label: "PDF 압축기",
-    icon: FileText,
-    accent: "blue",
-    Component: PdfCompressor,
+    label: "삽입그림 정리기",
+    icon: FileType,
+    accent: "teal",
+    Component: HwpImageConverter,
   },
   {
     id: "image-converter",
@@ -29,5 +30,13 @@ export const modules: UtilityModule[] = [
     icon: ImageIcon,
     accent: "indigo",
     Component: ImageConverter,
+  },
+  {
+    id: "pdf-compressor",
+    path: "/pdf",
+    label: "PDF 압축기",
+    icon: FileText,
+    accent: "blue",
+    Component: PdfCompressor,
   },
 ];

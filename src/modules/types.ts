@@ -2,7 +2,7 @@ import type { ComponentType } from "react";
 import type { LucideIcon } from "lucide-react";
 
 /** Accent colors supported by the sidebar. Add new ones to ACCENT_ACTIVE in App.tsx. */
-export type AccentColor = "blue" | "indigo" | "emerald" | "amber" | "rose";
+export type AccentColor = "blue" | "indigo" | "emerald" | "teal" | "amber" | "rose";
 
 /**
  * A single utility in the portal. One module === one sidebar entry + one route.

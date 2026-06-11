@@ -34,6 +34,7 @@ const ACCENT_ACTIVE: Record<AccentColor, string> = {
   blue: "bg-blue-500/10 text-blue-400 font-bold border border-blue-500/20 shadow-[0_0_15px_rgba(59,130,246,0.15)]",
   indigo: "bg-indigo-500/10 text-indigo-400 font-bold border border-indigo-500/20 shadow-[0_0_15px_rgba(99,102,241,0.15)]",
   emerald: "bg-emerald-500/10 text-emerald-400 font-bold border border-emerald-500/20 shadow-[0_0_15px_rgba(16,185,129,0.15)]",
+  teal: "bg-teal-500/10 text-teal-400 font-bold border border-teal-500/20 shadow-[0_0_15px_rgba(45,212,191,0.18)]",
   amber: "bg-amber-500/10 text-amber-400 font-bold border border-amber-500/20 shadow-[0_0_15px_rgba(245,158,11,0.15)]",
   rose: "bg-rose-500/10 text-rose-400 font-bold border border-rose-500/20 shadow-[0_0_15px_rgba(244,63,94,0.15)]",
 };

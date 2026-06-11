@@ -1,6 +1,7 @@
 import type { Express } from "express";
 import type { ApiModule } from "./types";
 import { appInfoModule } from "./appInfo";
+import { hwpImageModule } from "./hwpImage";
 
 /**
  * Backend counterpart to src/modules/registry.tsx. Each entry owns a slice of
@@ -14,6 +15,7 @@ import { appInfoModule } from "./appInfo";
  */
 export const apiModules: ApiModule[] = [
   appInfoModule,
+  hwpImageModule,
 ];
 
 /** Mount every registered module on the shared Express app. */

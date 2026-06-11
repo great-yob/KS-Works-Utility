@@ -154,12 +154,13 @@ export default function ImageConverter() {
       let logs: string[] = [`[시작] 총 ${total}개 파일 JPG 변환을 시작합니다.`];
       setFileState(prev => ({ ...prev, logs }));
 
+      let buffer = ""; // NDJSON 한 줄이 청크 경계에서 잘려도 이어붙이도록 버퍼링
       while (true) {
         const { done, value } = await reader.read();
-        if (done) break;
-
-        const chunk = decoder.decode(value, { stream: true });
-        const lines = chunk.split("\n").filter(l => l.trim());
+        buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
+        const parts = buffer.split("\n");
+        buffer = done ? "" : parts.pop() ?? "";
+        const lines = parts.filter(l => l.trim());
 
         for (const line of lines) {
           try {
@@ -173,9 +174,10 @@ export default function ImageConverter() {
               setFileState(prev => ({ ...prev, successCount: success, failCount: fail, outputDir, logs }));
             }
           } catch (e) {
-            // ignore JSON parse errors from partial chunks
+            // 잘못된 JSON 라인은 무시
           }
         }
+        if (done) break;
       }
 
       logs = [...logs, `[완료] 성공 ${success}건 / 실패 ${fail}건`, `[저장] ${outputDir}`];
