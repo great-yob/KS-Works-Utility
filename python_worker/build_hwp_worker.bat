@@ -23,6 +23,7 @@ pyinstaller --onefile --name hwp_worker --distpath dist ^
     --hidden-import win32com.client ^
     --hidden-import worker ^
     --hidden-import hwp_pagemap ^
+    --hidden-import hwp_pageapi ^
     hwp_worker.py
 
 if errorlevel 1 (

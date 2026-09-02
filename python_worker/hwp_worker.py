@@ -27,6 +27,7 @@ from PIL import Image
 try:
     from hwp_pagemap import (
         PageMap,
+        apply_exact_pages,
         build_page_map_hwp,
         build_page_map_hwpx,
         is_approx_hwp,
@@ -42,6 +43,9 @@ except Exception:                                   # pragma: no cover - 방어�
     class PageMap:                                  # ok=False → 아무것도 제외하지 않는다
         def __init__(self):
             self.pages, self.used, self.notes, self.ok = {}, set(), {}, False
+
+    def apply_exact_pages(page_map, resolver):
+        return False
 
     def build_page_map_hwp(path):
         return PageMap()
@@ -72,6 +76,22 @@ except Exception:                                   # pragma: no cover - 방어�
 
     def is_unused_hwpx(page_map, name):
         return False
+
+def refine_pages_with_hangul(page_map, path: str):
+    """한글이 설치돼 있으면 쪽 번호를 한글에게 직접 물어 정확한 값으로 바꿉니다.
+
+    파일만 보고 세는 쪽 번호는 표가 여러 쪽에 걸치면 어긋난다(그 정보가 파일에 없다).
+    한글은 조판 결과를 알고 있으므로, 그림이 매달린 위치를 물어보면 정확한 값을 준다.
+    한글이 없거나 느리거나 실패하면 아무 일도 일어나지 않고 추정값이 그대로 쓰인다."""
+    try:
+        from hwp_pageapi import resolve_pages
+    except Exception:
+        return False
+    try:
+        return apply_exact_pages(page_map, lambda anchors: resolve_pages(path, anchors))
+    except Exception:
+        return False
+
 
 # ─────────────────────────────────────────
 # 이미지 형식 감지 (바이너리 시그니처)
@@ -818,7 +838,10 @@ class HwpProcessor:
         size_skipped = 0
 
         # 그림별 쪽 번호도 같은 이유(BodyText 읽기 전용)로 COM 세션 전에 미리 만든다.
+        # 한글이 있으면 이 시점에 정확한 값으로 갈아끼운다(한글 COM은 이 뒤의 OLE 쓰기
+        # 세션과 겹치면 안 되므로 반드시 먼저 끝낸다).
         page_map = build_page_map_hwp(hwp_path)
+        refine_pages_with_hangul(page_map, hwp_path)
 
         # 임시 파일 경로를 초기화
         self._current_tmp_path = None
@@ -1024,6 +1047,7 @@ class HwpxProcessor:
         self.vector_origins: dict[str, tuple[str, bytes]] = {}
         # 그림별 쪽 번호(로그 표시용). 사이즈 조정 후처리에서도 쓰도록 보관한다.
         self.page_map = build_page_map_hwpx(hwpx_path)
+        refine_pages_with_hangul(self.page_map, hwpx_path)
 
         with zipfile.ZipFile(output_path, "r") as zf:
             entries = self._find_bindata_entries(zf)

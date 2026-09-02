@@ -160,6 +160,8 @@ class PageMap:
         self.notes: dict = {}       # 키 → 쪽을 못 매기는 쓰임새('채우기' 등)
         self.ok: bool = False
         self.approx_from = None     # 이 물리 쪽부터는 쪽 번호가 근사치(아래 설명 참고)
+        self.anchors: dict = {}     # 키 → [(문단번호, 글자위치)] — 한글에 정확한 쪽을 물을 좌표
+        self.exact: bool = False    # 한글이 직접 알려준 쪽으로 채워졌는가
 
     def lookup(self, *keys):
         for key in keys:
@@ -203,16 +205,28 @@ class PageMap:
         return not any(key in self.used for key in keys)
 
 
-def _add(page_map: PageMap, key, page: int, numbering: "_Numbering"):
-    """그림 1장의 위치를 (인쇄 번호, 물리 쪽) 쌍으로 기록합니다."""
+def _add(page_map: PageMap, key, page: int, numbering: "_Numbering", anchor=None):
+    """그림 1장의 위치를 (인쇄 번호, 물리 쪽) 쌍으로 기록합니다.
+
+    anchor=(문단번호, 글자위치)는 나중에 한글에게 '이 자리가 몇 쪽이냐'고 물어보기 위한
+    좌표입니다(hwp_pageapi). 추정값은 그대로 두고, 한글이 답하면 그 값으로 갈아끼웁니다."""
     entry = (numbering.display(page), page)
     page_map.used.add(key)
     pages = page_map.pages.setdefault(key, [])
     if len(pages) < MAX_PAGES_PER_IMAGE and (not pages or pages[-1] != entry):
         pages.append(entry)
+    _add_anchor(page_map, key, anchor)
 
 
-def _add_entries(page_map: PageMap, key, entries: list):
+def _add_anchor(page_map: PageMap, key, anchor):
+    if anchor is None:
+        return
+    anchors = page_map.anchors.setdefault(key, [])
+    if len(anchors) < MAX_PAGES_PER_IMAGE and anchor not in anchors:
+        anchors.append(anchor)
+
+
+def _add_entries(page_map: PageMap, key, entries: list, anchors: list = None):
     """이미 만들어진 (인쇄, 물리) 목록을 합칩니다(중복 제거, 쪽 순서 정렬)."""
     if not entries:
         return
@@ -221,6 +235,29 @@ def _add_entries(page_map: PageMap, key, entries: list):
     merged.extend(e for e in entries if e not in merged)
     merged.sort(key=lambda e: e[1])
     del merged[MAX_PAGES_PER_IMAGE:]
+    for anchor in anchors or []:
+        _add_anchor(page_map, key, anchor)
+
+
+def apply_exact_pages(page_map: PageMap, resolver) -> bool:
+    """한글이 알려준 정확한 쪽으로 갈아끼웁니다. resolver([(문단,글자)]) → [쪽] | None.
+
+    한글이 주는 값은 인쇄 쪽 번호라 (인쇄, 물리) 구분이 사라지므로 두 값을 같게 둡니다.
+    근사 표시(approx_from)도 해제합니다 — 더 이상 추정이 아니기 때문입니다."""
+    if not page_map.anchors:
+        return False
+    unique = sorted({a for anchors in page_map.anchors.values() for a in anchors})
+    pages = resolver(unique)
+    if not pages:
+        return False
+    lookup = dict(zip(unique, pages))
+    for key, anchors in page_map.anchors.items():
+        resolved = sorted({lookup[a] for a in anchors if a in lookup})
+        if resolved:
+            page_map.pages[key] = [(pg, pg) for pg in resolved[:MAX_PAGES_PER_IMAGE]]
+    page_map.approx_from = None
+    page_map.exact = True
+    return True
 
 
 # ─────────────────────────────────────────
@@ -272,6 +309,7 @@ def build_page_map_hwp(hwp_path: str) -> PageMap:
         # DocInfo에서 '그림 채우기 → BinData' 연결을 읽은 뒤 이 둘을 이어 붙인다.
         fill_pages: dict = {}
         shape_pages: dict = {}
+        para_index = -1             # 본문 전체에서 몇 번째 최상위 문단인가(한글 SetPos용)
         for section in sections:
             try:
                 raw = ole.openstream(section).read()
@@ -294,6 +332,7 @@ def build_page_map_hwp(hwp_path: str) -> PageMap:
             first_seg = True
             para_shape = None       # 현재 문단의 문단 모양 ID(쪽이 정해지면 기록)
             current_page = page     # 가장 최근 개체(CTRL_HEADER)가 놓인 쪽
+            current_anchor = None   # 그 개체의 (문단번호, 글자위치)
 
             for tag, level, rec in _iter_records(data):
                 if tag == TAG_PAGE_DEF and text_height is None and len(rec) >= 40:
@@ -303,6 +342,7 @@ def build_page_map_hwp(hwp_path: str) -> PageMap:
                     text_height = paper_h - m_top - m_bottom - m_header - m_footer
 
                 elif tag == TAG_PARA_HEADER and level == 0:
+                    para_index += 1
                     ctrl_positions, segs, ctrl_index = [], [], 0
                     pending_break = bool((rec[11] if len(rec) > 11 else 0) & PARA_BREAK_PAGE)
                     first_seg = True
@@ -332,15 +372,19 @@ def build_page_map_hwp(hwp_path: str) -> PageMap:
                                 and vert + height > text_height):
                             page_map.approx_from = page
                     if para_shape is not None and segs:
-                        _note_page(shape_pages, para_shape, segs[0][1], numbering)
+                        _note_page(shape_pages, para_shape, segs[0][1], numbering,
+                                   (para_index, 0))
                         para_shape = None
 
                 elif tag == TAG_CTRL_HEADER and level == 1:
                     # 최상위 문단에 직접 매달린 개체 → 앵커 문자 위치로 쪽 결정.
+                    char_pos = (ctrl_positions[ctrl_index]
+                                if ctrl_index < len(ctrl_positions) else 0)
                     if ctrl_index < len(ctrl_positions) and segs:
-                        current_page = _page_of_pos(segs, ctrl_positions[ctrl_index])
+                        current_page = _page_of_pos(segs, char_pos)
                     else:
                         current_page = page
+                    current_anchor = (para_index, char_pos)
                     ctrl_index += 1
                     # '새 번호로 시작' → 이 쪽부터 인쇄되는 번호를 다시 매긴다.
                     if rec[0:4][::-1] == CTRL_ID_NEW_NUMBER and len(rec) >= 10:
@@ -354,13 +398,13 @@ def build_page_map_hwp(hwp_path: str) -> PageMap:
                     # 값의 6288/6307이 유효 범위 안 — 이 위치가 맞다.)
                     fill_id = struct.unpack_from("<H", rec, 32)[0]
                     if fill_id:
-                        _note_page(fill_pages, fill_id, current_page, numbering)
+                        _note_page(fill_pages, fill_id, current_page, numbering, current_anchor)
 
                 elif tag == TAG_SHAPE_PICTURE and len(rec) >= 72:
                     # 그림은 자기를 감싼 개체(표·그룹 포함)의 쪽을 따른다.
                     bin_id = struct.unpack_from("<H", rec, 71)[0]
                     if 1 <= bin_id <= 0xFFFF:
-                        _add(page_map, bin_id, current_page, numbering)
+                        _add(page_map, bin_id, current_page, numbering, current_anchor)
 
             page += 1               # 다음 구역은 새 쪽에서 시작
 
@@ -377,12 +421,12 @@ def build_page_map_hwp(hwp_path: str) -> PageMap:
     return page_map
 
 
-def _note_page(store: dict, key: int, page: int, numbering: "_Numbering"):
-    """'이 ID가 이 쪽에서 쓰였다'를 기록합니다(중복 없이, 상한까지만)."""
+def _note_page(store: dict, key: int, page: int, numbering: "_Numbering", anchor=None):
+    """'이 ID가 이 쪽에서 쓰였다'를 (쪽, 앵커) 쌍으로 기록합니다(중복 없이, 상한까지만)."""
     entries = store.setdefault(key, [])
     entry = (numbering.display(page), page)
-    if len(entries) < MAX_PAGES_PER_IMAGE and entry not in entries:
-        entries.append(entry)
+    if len(entries) < MAX_PAGES_PER_IMAGE and not any(e == entry for e, _a in entries):
+        entries.append((entry, anchor))
 
 
 def _collect_docinfo_refs(ole, page_map: PageMap, fill_pages: dict = None,
@@ -454,12 +498,14 @@ def _collect_docinfo_refs(ole, page_map: PageMap, fill_pages: dict = None,
 
     # 채우기 그림 → 그 배경이 실제로 깔린 쪽들
     for fill_id, bin_id in image_fills.items():
-        entries = list(fill_pages.get(fill_id, []))                  # 표 셀 배경
+        found = list(fill_pages.get(fill_id, []))                    # 표 셀 배경
         for shape_id, ref in shape_to_fill.items():                  # 문단 배경
             if ref == fill_id:
-                entries.extend(shape_pages.get(shape_id, []))
-        if entries:
-            _add_entries(page_map, bin_id, entries)
+                found.extend(shape_pages.get(shape_id, []))
+        if found:
+            _add_entries(page_map, bin_id,
+                         [e for e, _a in found],
+                         [a for _e, a in found if a is not None])
         else:
             page_map.mark_used(bin_id, REASON_FILL)
 
@@ -528,6 +574,7 @@ def build_page_map_hwpx(hwpx_path: str) -> PageMap:
 
             page = 1
             numbering = _Numbering()
+            para_index = -1             # 본문 전체 기준 최상위 문단 번호(한글 SetPos용)
             for section in sections:
                 try:
                     root = ET.fromstring(zf.read(section).decode("utf-8", "replace"))
@@ -538,10 +585,12 @@ def build_page_map_hwpx(hwpx_path: str) -> PageMap:
                 for para in root:
                     if _local(para) != "p":
                         continue
+                    para_index += 1
                     segs, page, prev_line = _hwpx_para_lines(
                         para, page, prev_line, text_height, page_map)
                     if segs:
-                        _hwpx_collect_images(para, segs, page_map, id_to_file, numbering)
+                        _hwpx_collect_images(para, segs, page_map, id_to_file, numbering,
+                                             para_index)
                 page += 1
             page_map.ok = True
     except Exception:
@@ -599,7 +648,7 @@ def _hwpx_para_lines(para, page: int, prev_line, text_height=None, page_map=None
 
 
 def _hwpx_collect_images(para, segs: list, page_map: dict, id_to_file: dict,
-                         numbering: "_Numbering"):
+                         numbering: "_Numbering", para_index: int = -1):
     """문단 안의 그림을 문자 위치 기준으로 줄(=쪽)에 매핑합니다.
 
     표·그룹 등 컨테이너 개체는 하위 트리를 통째로 훑어(iter) 그 안의 그림까지
@@ -631,10 +680,11 @@ def _hwpx_collect_images(para, segs: list, page_map: dict, id_to_file: dict,
                 ref = elem.get("binaryItemIDRef")
                 if not ref:
                     continue
-                _add(page_map, ref.lower(), page, numbering)
+                anchor = (para_index, char_pos) if para_index >= 0 else None
+                _add(page_map, ref.lower(), page, numbering, anchor)
                 filename = id_to_file.get(ref)
                 if filename:
-                    _add(page_map, filename, page, numbering)
+                    _add(page_map, filename, page, numbering, anchor)
             char_pos += CTRL_CHAR_WIDTH
 
 
