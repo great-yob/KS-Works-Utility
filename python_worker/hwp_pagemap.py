@@ -59,8 +59,11 @@ FILL_SOLID = 1
 FILL_IMAGE = 2
 FILL_GRADIENT = 4
 
+TAG_PARA_SHAPE = 25
+
 # BodyText 레코드 태그
 TAG_PARA_HEADER = 66
+TAG_LIST_HEADER = 72        # 표 셀 등 — 셀 배경(테두리/채우기 ID)을 들고 있다
 TAG_PARA_TEXT = 67
 TAG_PARA_LINE_SEG = 69
 TAG_CTRL_HEADER = 71
@@ -179,6 +182,17 @@ def _add(page_map: PageMap, key, page: int, numbering: "_Numbering"):
         pages.append(entry)
 
 
+def _add_entries(page_map: PageMap, key, entries: list):
+    """이미 만들어진 (인쇄, 물리) 목록을 합칩니다(중복 제거, 쪽 순서 정렬)."""
+    if not entries:
+        return
+    page_map.used.add(key)
+    merged = page_map.pages.setdefault(key, [])
+    merged.extend(e for e in entries if e not in merged)
+    merged.sort(key=lambda e: e[1])
+    del merged[MAX_PAGES_PER_IMAGE:]
+
+
 # ─────────────────────────────────────────
 # HWP (OLE Compound File)
 # ─────────────────────────────────────────
@@ -222,6 +236,12 @@ def build_page_map_hwp(hwp_path: str) -> PageMap:
 
         page = 1
         numbering = _Numbering()
+        # 그림 채우기(배경)의 쪽을 알아내기 위한 중간 수집물.
+        #   fill_pages  : 테두리/채우기 ID → 그 배경이 깔린 표 셀들의 쪽
+        #   shape_pages : 문단 모양 ID     → 그 모양을 쓰는 문단들의 쪽
+        # DocInfo에서 '그림 채우기 → BinData' 연결을 읽은 뒤 이 둘을 이어 붙인다.
+        fill_pages: dict = {}
+        shape_pages: dict = {}
         for section in sections:
             try:
                 raw = ole.openstream(section).read()
@@ -241,6 +261,7 @@ def build_page_map_hwp(hwp_path: str) -> PageMap:
             ctrl_index = 0
             pending_break = False   # 현재 문단에 '쪽 나누기'가 걸려 있는가
             first_seg = True
+            para_shape = None       # 현재 문단의 문단 모양 ID(쪽이 정해지면 기록)
             current_page = page     # 가장 최근 개체(CTRL_HEADER)가 놓인 쪽
 
             for tag, level, rec in _iter_records(data):
@@ -248,6 +269,8 @@ def build_page_map_hwp(hwp_path: str) -> PageMap:
                     ctrl_positions, segs, ctrl_index = [], [], 0
                     pending_break = bool((rec[11] if len(rec) > 11 else 0) & PARA_BREAK_PAGE)
                     first_seg = True
+                    # 문단 모양 ID(offset 8) — 이 문단이 어느 쪽에 앉는지는 줄 정보가 와야 안다.
+                    para_shape = struct.unpack_from("<H", rec, 8)[0] if len(rec) >= 10 else None
 
                 elif tag == TAG_PARA_TEXT and level == 1:
                     ctrl_positions = _ctrl_char_positions(rec)
@@ -264,6 +287,9 @@ def build_page_map_hwp(hwp_path: str) -> PageMap:
                         prev_vert = vert
                         first_seg = False
                         segs.append((textpos, page))
+                    if para_shape is not None and segs:
+                        _note_page(shape_pages, para_shape, segs[0][1], numbering)
+                        para_shape = None
 
                 elif tag == TAG_CTRL_HEADER and level == 1:
                     # 최상위 문단에 직접 매달린 개체 → 앵커 문자 위치로 쪽 결정.
@@ -278,6 +304,14 @@ def build_page_map_hwp(hwp_path: str) -> PageMap:
                         if (prop & 0xF) == NEW_NUMBER_KIND_PAGE:
                             numbering.restart(current_page, start)
 
+                elif tag == TAG_LIST_HEADER and len(rec) >= 34:
+                    # 표 셀: offset 32의 테두리/채우기 ID. 셀 배경이 그림이면 그 그림이
+                    # 이 셀(=표가 놓인 쪽)에 보인다. (실측: 길이 47짜리 셀 레코드에서
+                    # 값의 6288/6307이 유효 범위 안 — 이 위치가 맞다.)
+                    fill_id = struct.unpack_from("<H", rec, 32)[0]
+                    if fill_id:
+                        _note_page(fill_pages, fill_id, current_page, numbering)
+
                 elif tag == TAG_SHAPE_PICTURE and len(rec) >= 72:
                     # 그림은 자기를 감싼 개체(표·그룹 포함)의 쪽을 따른다.
                     bin_id = struct.unpack_from("<H", rec, 71)[0]
@@ -287,7 +321,7 @@ def build_page_map_hwp(hwp_path: str) -> PageMap:
             page += 1               # 다음 구역은 새 쪽에서 시작
 
         # 본문 밖 참조(그림 채우기·그림 글머리표)까지 모아야 '미사용' 판단이 안전해진다.
-        _collect_docinfo_refs(ole, page_map)
+        _collect_docinfo_refs(ole, page_map, fill_pages, shape_pages)
         page_map.ok = True
     except Exception:
         page_map.ok = False         # 중간에 깨졌으면 아무것도 미사용으로 보지 않는다
@@ -299,7 +333,16 @@ def build_page_map_hwp(hwp_path: str) -> PageMap:
     return page_map
 
 
-def _collect_docinfo_refs(ole, page_map: PageMap):
+def _note_page(store: dict, key: int, page: int, numbering: "_Numbering"):
+    """'이 ID가 이 쪽에서 쓰였다'를 기록합니다(중복 없이, 상한까지만)."""
+    entries = store.setdefault(key, [])
+    entry = (numbering.display(page), page)
+    if len(entries) < MAX_PAGES_PER_IMAGE and entry not in entries:
+        entries.append(entry)
+
+
+def _collect_docinfo_refs(ole, page_map: PageMap, fill_pages: dict = None,
+                          shape_pages: dict = None):
     """DocInfo에서 '쪽으로 환산할 수 없는' 그림 참조를 모읍니다.
 
     실측(2026-09, 한국공인회계사회 실무해설 내지): BinData 148개 중 106개가 본문 그림이
@@ -313,7 +356,12 @@ def _collect_docinfo_refs(ole, page_map: PageMap):
 
     그러데이션이 섞이면 길이가 가변이라 위치를 특정할 수 없다. 그럴 때와 글머리표
     (BULLET/NUMBERING)처럼 배치가 확실치 않은 레코드는 **레코드 안의 모든 UINT16을 참조로
-    간주**한다 — 실제보다 넓게 잡히지만, 쓰이는 그림을 빠뜨리지 않는 안전한 방향이다."""
+    간주**한다 — 실제보다 넓게 잡히지만, 쓰이는 그림을 빠뜨리지 않는 안전한 방향이다.
+
+    채우기 그림에도 쪽을 매긴다: 본문 순회에서 모아 둔 fill_pages(테두리/채우기 ID → 쪽)와
+    shape_pages(문단 모양 ID → 쪽)를 여기서 이어 붙인다. 즉 '이 배경 그림을 쓰는 표 셀·문단이
+    몇 쪽에 있나'를 그림의 쪽으로 삼는다. 여러 곳에 깔렸으면 쪽이 여러 개가 되고(칩은 첫 쪽에
+    +를 붙여 보여 준다), 한 곳도 못 찾으면 쪽 없이 '채우기'로만 표시한다."""
     import zlib
     try:
         raw = ole.openstream("DocInfo").read()
@@ -327,8 +375,16 @@ def _collect_docinfo_refs(ole, page_map: PageMap):
         except Exception:
             data = raw
 
+    fill_pages = fill_pages or {}
+    shape_pages = shape_pages or {}
+    image_fills: dict = {}          # 테두리/채우기 ID(1부터) → BinData id
+    shape_to_fill: dict = {}        # 문단 모양 ID(0부터) → 테두리/채우기 ID
+    fill_index = 0
+    shape_index = -1
+
     for tag, _level, rec in _iter_records(data):
         if tag == TAG_BORDER_FILL and len(rec) >= 36:
+            fill_index += 1         # 다른 레코드가 참조하는 ID는 1부터 세는 등장 순서
             fill_type = struct.unpack_from("<I", rec, 32)[0]
             if not (fill_type & FILL_IMAGE):
                 continue
@@ -337,9 +393,12 @@ def _collect_docinfo_refs(ole, page_map: PageMap):
                 continue
             pos = 36 + (12 if fill_type & FILL_SOLID else 0)
             if pos + 6 <= len(rec):
-                page_map.mark_used(struct.unpack_from("<H", rec, pos + 4)[0], REASON_FILL)
+                image_fills[fill_index] = struct.unpack_from("<H", rec, pos + 4)[0]
             else:
                 _mark_all_uint16(rec, page_map, REASON_FILL)
+        elif tag == TAG_PARA_SHAPE and len(rec) >= 34:
+            shape_index += 1        # 문단이 참조하는 문단 모양 ID는 0부터 세는 등장 순서
+            shape_to_fill[shape_index] = struct.unpack_from("<H", rec, 32)[0]
         elif tag == TAG_BULLET and len(rec) >= 16:
             # 글머리표: offset 14의 '이미지 글머리 여부'가 켜진 것만 그림을 참조한다.
             # 그림 정보의 정확한 위치는 판본마다 흔들려서, 해당 레코드 안의 UINT16을 모두
@@ -348,6 +407,17 @@ def _collect_docinfo_refs(ole, page_map: PageMap):
             # 길어 우연히 작은 id들이 전부 '사용 중'으로 잡히고 제외가 무력화된다.
             if struct.unpack_from("<h", rec, 14)[0] != 0:
                 _mark_all_uint16(rec, page_map, REASON_BULLET)
+
+    # 채우기 그림 → 그 배경이 실제로 깔린 쪽들
+    for fill_id, bin_id in image_fills.items():
+        entries = list(fill_pages.get(fill_id, []))                  # 표 셀 배경
+        for shape_id, ref in shape_to_fill.items():                  # 문단 배경
+            if ref == fill_id:
+                entries.extend(shape_pages.get(shape_id, []))
+        if entries:
+            _add_entries(page_map, bin_id, entries)
+        else:
+            page_map.mark_used(bin_id, REASON_FILL)
 
 
 def _mark_all_uint16(rec: bytes, page_map: PageMap, reason: str):
