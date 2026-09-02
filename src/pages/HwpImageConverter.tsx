@@ -28,8 +28,9 @@ type LogEntry = {
   text: string;
   tone: LogTone;
   withPage?: boolean;
-  page?: number;
-  pages?: number[];
+  page?: number;          // 문서에 인쇄되는 쪽 번호
+  physicalPage?: number;  // 문서의 몇 번째 쪽 ('새 번호로 시작' 때문에 다를 때만)
+  pages?: number[];       // 같은 그림이 여러 곳에 쓰인 경우
 };
 
 const log = (
@@ -123,28 +124,42 @@ const LOG_STYLES: Record<LogTone, { row: string; tag: string; chip: string }> = 
   },
 };
 
+/** 칩 공통 모양 — 알약형, 볼드 없음, 줄 높이를 고정해 위아래 줄과 겹치지 않게 합니다. */
+const CHIP_BASE =
+  "shrink-0 inline-block px-1.5 rounded-full ring-1 text-[10px] leading-[15px] tabular-nums";
+
 /**
- * 그림이 원본 한글 문서에서 놓인 쪽 번호 칩("03p").
- * 워커가 한글의 줄 배치 정보로 계산한 값이라 표가 여러 쪽에 걸치는 문서에서는
- * 약간 어긋날 수 있어, 툴팁으로 그 사실을 알려 줍니다.
+ * 그림이 원본 한글 문서에서 놓인 쪽 칩("03p").
+ * 표시되는 값은 **문서에 인쇄되는 쪽 번호**입니다('새 번호로 시작' 반영). 문서의 몇 번째
+ * 쪽인지는 툴팁에 함께 보여 줍니다(한글 '문서 정보 → 그림 정보'가 쓰는 값).
  */
-function PageChip({ page, pages, tone }: { page?: number; pages?: number[]; tone: LogTone }) {
-  const style = LOG_STYLES[tone].chip;
+function PageChip({
+  page,
+  physicalPage,
+  pages,
+  tone,
+}: {
+  page?: number;
+  physicalPage?: number;
+  pages?: number[];
+  tone: LogTone;
+}) {
   if (typeof page !== "number") {
     return (
       <span
-        title="본문에서 위치를 찾지 못했습니다 (머리말·배경 그림이거나 문서에 배치되지 않은 이미지)"
-        className="shrink-0 inline-block px-1.5 rounded-full ring-1 text-[10px] font-bold tabular-nums bg-white/5 text-slate-500 ring-white/10"
+        title="본문에서 위치를 찾지 못했습니다 — 편집 중 지워진 그림의 잔여 데이터이거나 바탕쪽·배경 그림일 수 있습니다"
+        className={`${CHIP_BASE} bg-white/5 text-slate-500 ring-white/10`}
       >
-        ?p
+        미배치
       </span>
     );
   }
   const multi = pages && pages.length > 1;
+  const where = multi ? `${pages!.join(", ")}쪽에 사용됨` : `${page}쪽`;
   return (
     <span
-      title={multi ? `${pages!.join(", ")}쪽에 사용됨` : `원본 ${page}쪽`}
-      className={`shrink-0 inline-block px-1.5 rounded-full ring-1 text-[10px] font-bold tabular-nums ${style}`}
+      title={physicalPage ? `${where} (문서 ${physicalPage}번째 쪽)` : where}
+      className={`${CHIP_BASE} ${LOG_STYLES[tone].chip}`}
     >
       {String(page).padStart(2, "0")}p{multi ? "+" : ""}
     </span>
@@ -363,6 +378,7 @@ export default function HwpImageConverter() {
               const pageInfo = {
                 withPage: true,
                 page: data.page as number | undefined,
+                physicalPage: data.physicalPage as number | undefined,
                 pages: data.pages as number[] | undefined,
               };
               if (data.success) {
@@ -396,6 +412,7 @@ export default function HwpImageConverter() {
                 log("사이즈", `${data.name ? `${data.name}: ` : ""}${data.message}`, "size", {
                   withPage: true,
                   page: data.page as number | undefined,
+                  physicalPage: data.physicalPage as number | undefined,
                   pages: data.pages as number[] | undefined,
                 }),
               ];
@@ -702,12 +719,19 @@ export default function HwpImageConverter() {
           </div>
 
           {/* log window */}
-          <div className="flex-1 min-h-0 bg-black/30 border border-white/5 rounded-xl p-3 overflow-auto terminal-scroll font-mono text-[11px] leading-relaxed">
+          <div className="flex-1 min-h-0 bg-black/30 border border-white/5 rounded-xl p-3 overflow-auto terminal-scroll font-mono text-[11px] leading-5 space-y-1">
             {state.logs.length ? (
               state.logs.map((l, i) => (
                 <div key={i} className={`flex items-baseline gap-1.5 ${LOG_STYLES[l.tone].row}`}>
                   <span className={`shrink-0 ${LOG_STYLES[l.tone].tag}`}>[{l.tag}]</span>
-                  {l.withPage && <PageChip page={l.page} pages={l.pages} tone={l.tone} />}
+                  {l.withPage && (
+                    <PageChip
+                      page={l.page}
+                      physicalPage={l.physicalPage}
+                      pages={l.pages}
+                      tone={l.tone}
+                    />
+                  )}
                   <span className="whitespace-pre-wrap break-all">{l.text}</span>
                 </div>
               ))

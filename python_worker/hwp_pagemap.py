@@ -20,6 +20,14 @@ HWP/HWPX 어디에도 "이 그림은 12쪽"이라는 필드는 없다. 대신 �
 장이 **한 문단에 몰려 있는 문서**(문단 하나가 수십 쪽에 걸침)도 이 방식이라야 맞는다.
 단순히 레코드 순서대로 세면 전부 마지막 쪽으로 몰린다.
 
+── 인쇄되는 쪽 번호 vs 문서 몇 번째 쪽 ──────────────────────────────────
+위에서 센 것은 '문서의 몇 번째 쪽'(물리 쪽)이다. 그런데 표지·목차 뒤에서 본문을 1쪽으로
+다시 시작하는 문서가 흔하다(한글 '새 번호로 시작'). 사용자가 한글에서 찾아갈 때 보는 것은
+**인쇄되는 번호**이므로, 새 번호 컨트롤(OLE: CTRL_HEADER `nwno`, 번호 종류 0=쪽 /
+HWPX: `<hp:newNum numType="PAGE" num="N"/>`)을 만나면 그 쪽부터 번호를 재설정한다.
+따라서 매핑 결과는 (인쇄 번호, 물리 쪽) 쌍이고, 로그 칩은 인쇄 번호를, 툴팁이 물리 쪽을
+보여 준다. 한글 '문서 정보 → 그림 정보'의 쪽 수는 물리 쪽이라 서로 다를 수 있다.
+
 실측(2026-09, `D:\\작업방`): 한글에서 내보낸 PDF 쪽수와 비교해 교재 2건은 46/46,
 150/150으로 정확히 일치했고, 각주·여러 쪽에 걸친 표가 많은 연구보고서 1건은 153/160로
 약 5% 적게 나왔다. 표가 여러 쪽에 걸치는 경우는 표 안쪽 문단이 별도 좌표계를 쓰기 때문에
@@ -47,6 +55,10 @@ TAG_SHAPE_PICTURE = 85
 LINE_SEG_SIZE = 36          # 줄 정보 1개 크기(바이트)
 PARA_BREAK_PAGE = 0x04      # 문단머리 '나누기 종류' 중 쪽 나누기 비트
 MAX_PAGES_PER_IMAGE = 20    # 같은 그림이 여러 곳에 쓰인 경우 보관할 쪽 수 상한
+
+# '새 번호로 시작' 컨트롤. OLE는 CTRL_HEADER 앞 4바이트에 ID가 뒤집혀 들어간다('onwn').
+CTRL_ID_NEW_NUMBER = b"nwno"
+NEW_NUMBER_KIND_PAGE = 0    # 속성 하위 4비트의 번호 종류. 0=쪽(그림/표/수식 번호는 무시)
 
 
 # ─────────────────────────────────────────
@@ -84,10 +96,25 @@ def _page_of_pos(segs: list, char_pos: int) -> int:
     return page
 
 
-def _add(page_map: dict, key, page: int):
+class _Numbering:
+    """물리 쪽 → 문서에 인쇄되는 쪽 번호. '새 번호로 시작'을 만나면 그 쪽부터 재설정한다."""
+
+    def __init__(self):
+        self.offset = 0
+
+    def restart(self, physical_page: int, start_number: int):
+        self.offset = start_number - physical_page
+
+    def display(self, physical_page: int) -> int:
+        return physical_page + self.offset
+
+
+def _add(page_map: dict, key, page: int, numbering: "_Numbering"):
+    """그림 1장의 위치를 (인쇄 번호, 물리 쪽) 쌍으로 기록합니다."""
+    entry = (numbering.display(page), page)
     pages = page_map.setdefault(key, [])
-    if len(pages) < MAX_PAGES_PER_IMAGE and (not pages or pages[-1] != page):
-        pages.append(page)
+    if len(pages) < MAX_PAGES_PER_IMAGE and (not pages or pages[-1] != entry):
+        pages.append(entry)
 
 
 # ─────────────────────────────────────────
@@ -114,7 +141,7 @@ def _ctrl_char_positions(para_text: bytes) -> list:
 
 
 def build_page_map_hwp(hwp_path: str) -> dict:
-    """HWP(OLE)의 bin id → 그림이 놓인 쪽 목록. 실패 시 {}."""
+    """HWP(OLE)의 bin id → [(인쇄 번호, 물리 쪽), ...]. 실패 시 {}."""
     import zlib
     try:
         import olefile
@@ -132,6 +159,7 @@ def build_page_map_hwp(hwp_path: str) -> dict:
         sections.sort(key=lambda n: int(re.sub(r"\D", "", n[1]) or 0))
 
         page = 1
+        numbering = _Numbering()
         for section in sections:
             try:
                 raw = ole.openstream(section).read()
@@ -182,12 +210,17 @@ def build_page_map_hwp(hwp_path: str) -> dict:
                     else:
                         current_page = page
                     ctrl_index += 1
+                    # '새 번호로 시작' → 이 쪽부터 인쇄되는 번호를 다시 매긴다.
+                    if rec[0:4][::-1] == CTRL_ID_NEW_NUMBER and len(rec) >= 10:
+                        prop, start = struct.unpack_from("<IH", rec, 4)
+                        if (prop & 0xF) == NEW_NUMBER_KIND_PAGE:
+                            numbering.restart(current_page, start)
 
                 elif tag == TAG_SHAPE_PICTURE and len(rec) >= 72:
                     # 그림은 자기를 감싼 개체(표·그룹 포함)의 쪽을 따른다.
                     bin_id = struct.unpack_from("<H", rec, 71)[0]
                     if 1 <= bin_id <= 0xFFFF:
-                        _add(page_map, bin_id, current_page)
+                        _add(page_map, bin_id, current_page, numbering)
 
             page += 1               # 다음 구역은 새 쪽에서 시작
     except Exception:
@@ -225,7 +258,8 @@ def _hwpx_manifest(zf: zipfile.ZipFile) -> dict:
 
 
 def build_page_map_hwpx(hwpx_path: str) -> dict:
-    """HWPX의 그림 → 쪽 목록. 키는 BinData 파일명(소문자)과 binaryItemIDRef 둘 다. 실패 시 {}."""
+    """HWPX의 그림 → [(인쇄 번호, 물리 쪽), ...]. 키는 BinData 파일명(소문자)과
+    binaryItemIDRef 둘 다. 실패 시 {}."""
     try:
         import xml.etree.ElementTree as ET
     except Exception:
@@ -239,6 +273,7 @@ def build_page_map_hwpx(hwpx_path: str) -> dict:
             sections.sort(key=lambda n: int(re.search(r"section(\d+)\.xml$", n, re.I).group(1)))
 
             page = 1
+            numbering = _Numbering()
             for section in sections:
                 try:
                     root = ET.fromstring(zf.read(section).decode("utf-8", "replace"))
@@ -250,7 +285,7 @@ def build_page_map_hwpx(hwpx_path: str) -> dict:
                         continue
                     segs, page, prev_vert = _hwpx_para_lines(para, page, prev_vert)
                     if segs:
-                        _hwpx_collect_images(para, segs, page_map, id_to_file)
+                        _hwpx_collect_images(para, segs, page_map, id_to_file, numbering)
                 page += 1
     except Exception:
         return page_map
@@ -283,11 +318,14 @@ def _hwpx_para_lines(para, page: int, prev_vert):
     return segs, page, prev_vert
 
 
-def _hwpx_collect_images(para, segs: list, page_map: dict, id_to_file: dict):
+def _hwpx_collect_images(para, segs: list, page_map: dict, id_to_file: dict,
+                         numbering: "_Numbering"):
     """문단 안의 그림을 문자 위치 기준으로 줄(=쪽)에 매핑합니다.
 
     표·그룹 등 컨테이너 개체는 하위 트리를 통째로 훑어(iter) 그 안의 그림까지
-    '컨테이너가 놓인 쪽'으로 기록한다(표가 여러 쪽에 걸치면 시작 쪽으로 보고됨)."""
+    '컨테이너가 놓인 쪽'으로 기록한다(표가 여러 쪽에 걸치면 시작 쪽으로 보고됨).
+    같은 순회에서 '새 번호로 시작'(`<hp:newNum numType="PAGE">`)도 처리해, 그 쪽부터
+    인쇄되는 쪽 번호를 다시 매긴다."""
     char_pos = 0
     for run in para:
         if _local(run) != "run":
@@ -301,15 +339,22 @@ def _hwpx_collect_images(para, segs: list, page_map: dict, id_to_file: dict):
                 continue
             page = _page_of_pos(segs, char_pos)
             for elem in node.iter():
-                if _local(elem) != "img":
+                local = _local(elem)
+                if local == "newNum" and elem.get("numType", "").upper() == "PAGE":
+                    try:
+                        numbering.restart(page, int(elem.get("num", "1")))
+                    except ValueError:
+                        pass
+                    continue
+                if local != "img":
                     continue
                 ref = elem.get("binaryItemIDRef")
                 if not ref:
                     continue
-                _add(page_map, ref.lower(), page)
+                _add(page_map, ref.lower(), page, numbering)
                 filename = id_to_file.get(ref)
                 if filename:
-                    _add(page_map, filename, page)
+                    _add(page_map, filename, page, numbering)
             char_pos += CTRL_CHAR_WIDTH
 
 
@@ -318,7 +363,7 @@ def _hwpx_collect_images(para, segs: list, page_map: dict, id_to_file: dict):
 # ─────────────────────────────────────────
 
 def lookup_hwp(page_map: dict, stream_name: str):
-    """'BIN0003.png' → 쪽 목록(없으면 None)."""
+    """'BIN0003.png' → [(인쇄 번호, 물리 쪽), ...] (없으면 None)."""
     m = re.match(r"^BIN([0-9A-Fa-f]{4})\.", stream_name)
     if not m:
         return None
@@ -326,6 +371,6 @@ def lookup_hwp(page_map: dict, stream_name: str):
 
 
 def lookup_hwpx(page_map: dict, entry_name: str):
-    """'BinData/image1.BMP' 또는 'image1' → 쪽 목록(없으면 None)."""
+    """'BinData/image1.BMP' 또는 'image1' → [(인쇄 번호, 물리 쪽), ...] (없으면 None)."""
     name = entry_name.split("/")[-1].lower()
     return page_map.get(name) or page_map.get(Path(name).stem)

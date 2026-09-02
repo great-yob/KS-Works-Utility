@@ -1111,12 +1111,20 @@ def emit_progress(success: bool, name: str, from_fmt: str, to_fmt: str, message:
 
 
 def _page_fields(pages: list) -> dict:
-    """쪽 정보를 NDJSON 필드로 만듭니다. page=대표(첫) 쪽, pages=여러 곳에 쓰였을 때 전체."""
+    """쪽 정보를 NDJSON 필드로 만듭니다. pages는 [(인쇄 번호, 물리 쪽), ...].
+
+    page          = 문서에 인쇄되는 쪽 번호(사용자가 한글에서 보는 번호)
+    physicalPage  = 문서의 몇 번째 쪽인지. '새 번호로 시작' 때문에 다를 때만 넣는다.
+    pages         = 같은 그림이 여러 곳에 쓰였을 때 인쇄 번호 전체
+    """
     if not pages:
         return {}
-    out = {"page": pages[0]}
+    display, physical = pages[0]
+    out = {"page": display}
+    if physical != display:
+        out["physicalPage"] = physical
     if len(pages) > 1:
-        out["pages"] = pages
+        out["pages"] = [d for d, _ in pages]
     return out
 
 def emit_done(total_converted: int, total_skipped: int):
