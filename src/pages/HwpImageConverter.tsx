@@ -20,7 +20,7 @@ type ConvertMode = "selective" | "all";
  * 로그 한 줄.
  *  - tone  : 색상 계열. 실패/오류는 붉은 계열로 한눈에 띄게 합니다.
  *  - page  : 그림이 원본 문서에서 놓인 쪽 번호(워커가 레이아웃 정보로 계산).
- *            withPage가 true인데 page가 없으면 '본문에서 못 찾음(?p)'으로 표시합니다.
+ *            쪽도 쓰임새도 없으면 칩을 아예 그리지 않습니다.
  */
 type LogTone = "info" | "success" | "fail" | "size";
 
@@ -118,61 +118,44 @@ function formatBytes(bytes: number): string {
 
 /** 로그 줄 전체 / 대괄호 태그 / 쪽 칩의 색상 (실패는 붉은 계열로 즉시 눈에 띄게) */
 const LOG_STYLES: Record<LogTone, { row: string; tag: string; chip: string }> = {
-  info: { row: "text-slate-300", tag: "text-slate-500", chip: "bg-white/5 text-slate-400 ring-white/10" },
-  success: { row: "text-slate-300", tag: "text-teal-400/90", chip: "bg-teal-400/15 text-teal-200 ring-teal-400/25" },
-  size: { row: "text-slate-300", tag: "text-amber-400/90", chip: "bg-amber-400/15 text-amber-200 ring-amber-400/25" },
+  info: { row: "text-slate-300", tag: "text-slate-500", chip: "bg-white/10 ring-white/15" },
+  success: { row: "text-slate-300", tag: "text-teal-400/90", chip: "bg-teal-400/20 ring-teal-400/30" },
+  size: { row: "text-slate-300", tag: "text-amber-400/90", chip: "bg-amber-400/20 ring-amber-400/30" },
   fail: {
     row: "text-red-300 bg-red-500/10 border-l-2 border-red-400/70 pl-1.5 -ml-1.5 rounded-r",
     tag: "text-red-400 font-bold",
-    chip: "bg-red-500/20 text-red-200 ring-red-400/40",
+    chip: "bg-red-500/30 ring-red-400/40",
   },
 };
 
 /** 칩 공통 모양 — 알약형, 볼드 없음, 줄 높이를 고정해 위아래 줄과 겹치지 않게 합니다. */
 const CHIP_BASE =
-  "shrink-0 inline-block px-1.5 rounded-full ring-1 text-[10px] leading-[15px] tabular-nums";
+  "shrink-0 inline-block px-1.5 rounded-full ring-1 text-[10px] leading-[15px] tabular-nums text-white";
 
 /**
- * 그림이 원본 한글 문서에서 놓인 쪽 칩("03p").
- * 표시되는 값은 **문서에 인쇄되는 쪽 번호**입니다('새 번호로 시작' 반영). 문서의 몇 번째
- * 쪽인지는 툴팁에 함께 보여 줍니다(한글 '문서 정보 → 그림 정보'가 쓰는 값).
+ * 그림이 원본 한글 문서에서 놓인 쪽 칩("3p").
+ * 값은 **문서에 인쇄되는 쪽 번호**입니다('새 번호로 시작' 반영). 같은 그림이 여러 곳에
+ * 쓰이면 쪽을 모두 나열합니다("3, 13, 45p").
  */
 function PageChip({
   page,
-  physicalPage,
   pages,
   pageNote,
   tone,
 }: {
   page?: number;
-  physicalPage?: number;
   pages?: number[];
   pageNote?: string;
   tone: LogTone;
 }) {
   if (typeof page !== "number") {
-    // 쪽을 매길 수 없는 쓰임새(문단·표의 그림 채우기, 그림 글머리표, 바탕쪽 등).
+    // 쪽을 매길 수 없는 쓰임새(적용된 곳을 찾지 못한 그림 채우기, 그림 글머리표, 바탕쪽 등).
     // 실제로 쓰이는 그림이므로 변환은 그대로 하고, 어디에 쓰이는지만 알려 줍니다.
     if (!pageNote) return null;
-    return (
-      <span
-        title="특정 쪽이 아니라 문서 전체에서 쓰이는 그림입니다 (문단·표의 그림 채우기, 그림 글머리표, 바탕쪽 등)"
-        className={`${CHIP_BASE} bg-sky-400/10 text-sky-200/80 ring-sky-400/20`}
-      >
-        {pageNote}
-      </span>
-    );
+    return <span className={`${CHIP_BASE} bg-sky-400/15 ring-sky-400/25`}>{pageNote}</span>;
   }
-  const multi = pages && pages.length > 1;
-  const where = multi ? `${pages!.join(", ")}쪽에 사용됨` : `${page}쪽`;
-  return (
-    <span
-      title={physicalPage ? `${where} (문서 ${physicalPage}번째 쪽)` : where}
-      className={`${CHIP_BASE} ${LOG_STYLES[tone].chip}`}
-    >
-      {String(page).padStart(2, "0")}p{multi ? "+" : ""}
-    </span>
-  );
+  const list = pages && pages.length > 1 ? pages.join(", ") : String(page);
+  return <span className={`${CHIP_BASE} ${LOG_STYLES[tone].chip}`}>{list}p</span>;
 }
 
 /* ─────────────── 컴포넌트 ─────────────── */
@@ -750,7 +733,6 @@ export default function HwpImageConverter() {
                   {l.withPage && (
                     <PageChip
                       page={l.page}
-                      physicalPage={l.physicalPage}
                       pages={l.pages}
                       pageNote={l.pageNote}
                       tone={l.tone}
