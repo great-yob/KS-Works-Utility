@@ -22,6 +22,28 @@ import zipfile
 from pathlib import Path
 from PIL import Image
 
+# 그림이 놓인 쪽 번호(로그의 "03p" 칩)를 계산하는 보조 모듈.
+# 프리즈된 exe에서 번들이 누락돼도 변환 자체는 계속돼야 하므로 실패를 흡수한다.
+try:
+    from hwp_pagemap import (
+        build_page_map_hwp,
+        build_page_map_hwpx,
+        lookup_hwp,
+        lookup_hwpx,
+    )
+except Exception:                                   # pragma: no cover - 방어적 폴백
+    def build_page_map_hwp(path):
+        return {}
+
+    def build_page_map_hwpx(path):
+        return {}
+
+    def lookup_hwp(page_map, name):
+        return None
+
+    def lookup_hwpx(page_map, name):
+        return None
+
 # ─────────────────────────────────────────
 # 이미지 형식 감지 (바이너리 시그니처)
 # ─────────────────────────────────────────
@@ -255,7 +277,7 @@ def _resize_jpg_bytes(data: bytes, f: float, target_dpi: int = 300) -> bytes:
     return out.getvalue()
 
 
-def size_adjust_hwpx(path: str, vector_origins: dict = None) -> None:
+def size_adjust_hwpx(path: str, vector_origins: dict = None, page_map: dict = None) -> None:
     """변환 완료된 HWPX에 '사이즈 조정'을 적용한다(변환과 분리된 후처리).
 
     한글이 그림에 표시하는 '확대/축소 비율'(실측으로 확정한 식):
@@ -275,6 +297,7 @@ def size_adjust_hwpx(path: str, vector_origins: dict = None) -> None:
     되는 걸 막는다. HWPX는 자르기가 비율(imgClip/imgDim=1.0)이라 픽셀이 바뀌어도 XML 수정이
     불필요하다(OLE의 off44와 달리). EMF는 좌표 검증이 어려워 건너뛴다(원본 렌더 유지)."""
     vector_origins = vector_origins or {}
+    page_map = page_map or {}
     PIC_RE = re.compile(r'<hp:pic\b.*?</hp:pic>', re.S)
     SECTION_RE = re.compile(r'section\d+\.xml$', re.I)
 
@@ -323,6 +346,7 @@ def size_adjust_hwpx(path: str, vector_origins: dict = None) -> None:
     adjusted = 0
     skipped = 0
     for ref, (cw, ch, cfw, cfh) in ref_info.items():
+        pages = page_map.get(ref.lower())   # 로그에 붙일 쪽 번호(변환 전 이름 기준 맵)
         if ref_count.get(ref, 0) != 1:    # 같은 이미지가 여러 곳에 다른 크기로 → 안전하게 skip
             skipped += 1
             continue
@@ -374,10 +398,12 @@ def size_adjust_hwpx(path: str, vector_origins: dict = None) -> None:
                 msg = (f"사이즈 조정: 표시 {round(eff)}dpi→{int(TARGET_DPI)}dpi, 비율→100% "
                        f"(용량 {before // 1024}KB→{len(contents[key]) // 1024}KB)")
             adjusted += 1
-            _print_json({"event": "size", "name": href.split("/")[-1], "message": msg})
+            _print_json({"event": "size", "name": href.split("/")[-1], "message": msg,
+                         **_page_fields(pages)})
         except Exception as e:
             skipped += 1
-            _print_json({"event": "size", "name": href, "message": f"사이즈 조정 실패: {e}"})
+            _print_json({"event": "size", "name": href, "message": f"사이즈 조정 실패: {e}",
+                         **_page_fields(pages)})
 
     if adjusted == 0:
         _print_json({"event": "sizeDone", "adjusted": 0, "skipped": skipped})
@@ -760,6 +786,9 @@ class HwpProcessor:
         size_adjusted = 0
         size_skipped = 0
 
+        # 그림별 쪽 번호도 같은 이유(BodyText 읽기 전용)로 COM 세션 전에 미리 만든다.
+        page_map = build_page_map_hwp(hwp_path)
+
         # 임시 파일 경로를 초기화
         self._current_tmp_path = None
         storage = self._open_storage(hwp_path, read_only=False)
@@ -780,6 +809,8 @@ class HwpProcessor:
         stream_renames = []
 
         for name in stream_names:
+            # 성공·실패 어느 쪽이든 로그에 쪽을 붙일 수 있도록 먼저 조회해 둔다.
+            pages = lookup_hwp(page_map, name)
             try:
                 data = self._read_stream(bindata, name)
                 uncomp_data, comp_type = self._decompress(data)
@@ -796,7 +827,7 @@ class HwpProcessor:
                 try:
                     jpg_data = image_bytes_to_jpg(uncomp_data, fmt)
                 except Exception as e:
-                    emit_progress(False, name, fmt, "jpg", f"변환 실패: {e}")
+                    emit_progress(False, name, fmt, "jpg", f"변환 실패: {e}", pages)
                     skipped += 1
                     continue
 
@@ -814,12 +845,14 @@ class HwpProcessor:
                             size_adjusted += 1
                             _print_json({"event": "size", "name": name,
                                          "message": f"사이즈 조정: 표시 {round(eff)}dpi "
-                                                    f"(용량 {before_kb}KB→{len(jpg_data)//1024}KB)"})
+                                                    f"(용량 {before_kb}KB→{len(jpg_data)//1024}KB)",
+                                         **_page_fields(pages)})
                         else:
                             size_skipped += 1
                     except Exception as e:
                         size_skipped += 1
-                        _print_json({"event": "size", "name": name, "message": f"사이즈 조정 실패: {e}"})
+                        _print_json({"event": "size", "name": name,
+                                     "message": f"사이즈 조정 실패: {e}", **_page_fields(pages)})
 
                 # 압축 유지
                 jpg_data_out = self._compress(jpg_data, comp_type)
@@ -835,10 +868,10 @@ class HwpProcessor:
                         stream_renames.append((name, new_name))
 
                 converted += 1
-                emit_progress(True, name, fmt, "jpg", "변환 완료")
+                emit_progress(True, name, fmt, "jpg", "변환 완료", pages)
 
             except Exception as e:
-                emit_progress(False, name, "unknown", "jpg", f"처리 오류: {e}")
+                emit_progress(False, name, "unknown", "jpg", f"처리 오류: {e}", pages)
                 skipped += 1
 
         # 모든 스트림 변환 완료 후 DocInfo 일괄 패치
@@ -944,6 +977,8 @@ class HwpxProcessor:
         # 사이즈 조정용: 변환된 벡터(WMF/EMF)의 '원본 바이트'를 출력 ZIP 경로로 보관.
         # size_adjust_hwpx가 다운샘플(선 흐려짐) 대신 원본 벡터를 작은 크기로 재렌더하도록.
         self.vector_origins: dict[str, tuple[str, bytes]] = {}
+        # 그림별 쪽 번호(로그 표시용). 사이즈 조정 후처리에서도 쓰도록 보관한다.
+        self.page_map = build_page_map_hwpx(hwpx_path)
 
         with zipfile.ZipFile(output_path, "r") as zf:
             entries = self._find_bindata_entries(zf)
@@ -955,6 +990,7 @@ class HwpxProcessor:
                     fmt = self._get_format_from_name(entry)
 
                 original_name = Path(entry).name
+                pages = lookup_hwpx(self.page_map, entry)
 
                 if not should_convert(fmt, mode):
                     skipped += 1
@@ -963,7 +999,7 @@ class HwpxProcessor:
                 try:
                     jpg_data = image_bytes_to_jpg(data, fmt)
                 except Exception as e:
-                    emit_progress(False, original_name, fmt, "jpg", f"변환 실패: {e}")
+                    emit_progress(False, original_name, fmt, "jpg", f"변환 실패: {e}", pages)
                     skipped += 1
                     continue
 
@@ -978,7 +1014,7 @@ class HwpxProcessor:
                     self.vector_origins[new_entry] = (fmt, data)
 
                 converted += 1
-                emit_progress(True, original_name, fmt, "jpg", "변환 완료")
+                emit_progress(True, original_name, fmt, "jpg", "변환 완료", pages)
 
         if not replacements:
             emit_done(converted, skipped)
@@ -1059,15 +1095,29 @@ def _print_json(data: dict):
     sys.stdout.buffer.write(json_bytes + b'\n')
     sys.stdout.buffer.flush()
 
-def emit_progress(success: bool, name: str, from_fmt: str, to_fmt: str, message: str):
-    _print_json({
+def emit_progress(success: bool, name: str, from_fmt: str, to_fmt: str, message: str,
+                  pages: list = None):
+    """진행 상황 1건. pages는 그림이 놓인 쪽 목록(문서 순서) — 없으면 필드를 생략한다."""
+    data = {
         "event": "progress",
         "success": success,
         "name": name,
         "from": from_fmt,
         "to": to_fmt,
         "message": message,
-    })
+    }
+    data.update(_page_fields(pages))
+    _print_json(data)
+
+
+def _page_fields(pages: list) -> dict:
+    """쪽 정보를 NDJSON 필드로 만듭니다. page=대표(첫) 쪽, pages=여러 곳에 쓰였을 때 전체."""
+    if not pages:
+        return {}
+    out = {"page": pages[0]}
+    if len(pages) > 1:
+        out["pages"] = pages
+    return out
 
 def emit_done(total_converted: int, total_skipped: int):
     _print_json({
@@ -1168,7 +1218,8 @@ def main():
                 if args.size_adjust:
                     try:
                         size_adjust_hwpx(args.output,
-                                         vector_origins=getattr(processor, "vector_origins", None))
+                                         vector_origins=getattr(processor, "vector_origins", None),
+                                         page_map=getattr(processor, "page_map", None))
                     except Exception as e:
                         emit_error(f"사이즈 조정 실패: {e}")
             else:

@@ -15,6 +15,30 @@ type ImageInfo = { name: string; format: string; size: number };
 
 type ConvertMode = "selective" | "all";
 
+/**
+ * 로그 한 줄.
+ *  - tone  : 색상 계열. 실패/오류는 붉은 계열로 한눈에 띄게 합니다.
+ *  - page  : 그림이 원본 문서에서 놓인 쪽 번호(워커가 레이아웃 정보로 계산).
+ *            withPage가 true인데 page가 없으면 '본문에서 못 찾음(?p)'으로 표시합니다.
+ */
+type LogTone = "info" | "success" | "fail" | "size";
+
+type LogEntry = {
+  tag: string;
+  text: string;
+  tone: LogTone;
+  withPage?: boolean;
+  page?: number;
+  pages?: number[];
+};
+
+const log = (
+  tag: string,
+  text: string,
+  tone: LogTone = "info",
+  extra: Partial<LogEntry> = {}
+): LogEntry => ({ tag, text, tone, ...extra });
+
 type HwpState = {
   status: "idle" | "ready" | "scanned" | "converting" | "success" | "error";
   filePath: string;
@@ -28,7 +52,7 @@ type HwpState = {
   outputDir: string;
   outputPath: string;
   errorMessage?: string;
-  logs: string[];
+  logs: LogEntry[];
 };
 
 const INITIAL_STATE: HwpState = {
@@ -85,6 +109,48 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+/* ─────────────── 로그 표시 ─────────────── */
+
+/** 로그 줄 전체 / 대괄호 태그 / 쪽 칩의 색상 (실패는 붉은 계열로 즉시 눈에 띄게) */
+const LOG_STYLES: Record<LogTone, { row: string; tag: string; chip: string }> = {
+  info: { row: "text-slate-300", tag: "text-slate-500", chip: "bg-white/5 text-slate-400 ring-white/10" },
+  success: { row: "text-slate-300", tag: "text-teal-400/90", chip: "bg-teal-400/15 text-teal-200 ring-teal-400/25" },
+  size: { row: "text-slate-300", tag: "text-amber-400/90", chip: "bg-amber-400/15 text-amber-200 ring-amber-400/25" },
+  fail: {
+    row: "text-red-300 bg-red-500/10 border-l-2 border-red-400/70 pl-1.5 -ml-1.5 rounded-r",
+    tag: "text-red-400 font-bold",
+    chip: "bg-red-500/20 text-red-200 ring-red-400/40",
+  },
+};
+
+/**
+ * 그림이 원본 한글 문서에서 놓인 쪽 번호 칩("03p").
+ * 워커가 한글의 줄 배치 정보로 계산한 값이라 표가 여러 쪽에 걸치는 문서에서는
+ * 약간 어긋날 수 있어, 툴팁으로 그 사실을 알려 줍니다.
+ */
+function PageChip({ page, pages, tone }: { page?: number; pages?: number[]; tone: LogTone }) {
+  const style = LOG_STYLES[tone].chip;
+  if (typeof page !== "number") {
+    return (
+      <span
+        title="본문에서 위치를 찾지 못했습니다 (머리말·배경 그림이거나 문서에 배치되지 않은 이미지)"
+        className="shrink-0 inline-block px-1.5 rounded-full ring-1 text-[10px] font-bold tabular-nums bg-white/5 text-slate-500 ring-white/10"
+      >
+        ?p
+      </span>
+    );
+  }
+  const multi = pages && pages.length > 1;
+  return (
+    <span
+      title={multi ? `${pages!.join(", ")}쪽에 사용됨` : `원본 ${page}쪽`}
+      className={`shrink-0 inline-block px-1.5 rounded-full ring-1 text-[10px] font-bold tabular-nums ${style}`}
+    >
+      {String(page).padStart(2, "0")}p{multi ? "+" : ""}
+    </span>
+  );
+}
+
 /* ─────────────── 컴포넌트 ─────────────── */
 
 export default function HwpImageConverter() {
@@ -129,7 +195,7 @@ export default function HwpImageConverter() {
       filePath,
       fileName,
       fileType: ext,
-      logs: [`[준비] ${fileName} 파일이 추가되었습니다. '시작' 버튼을 누르면 작업을 진행합니다.`],
+      logs: [log("준비", `${fileName} 파일이 추가되었습니다. '시작' 버튼을 누르면 작업을 진행합니다.`)],
     }));
   };
 
@@ -172,8 +238,8 @@ export default function HwpImageConverter() {
         ...prev,
         targetCount: newTarget,
         logs: [
-          ...prev.logs.filter((l) => !l.startsWith("[대상]")),
-          `[대상] 변환 대상: ${newTarget}개`,
+          ...prev.logs.filter((l) => l.tag !== "대상"),
+          log("대상", `변환 대상: ${newTarget}개`),
         ],
       }));
     }
@@ -187,7 +253,7 @@ export default function HwpImageConverter() {
     setState((prev) => ({
       ...prev,
       status: "converting", // 스캔 중에도 진행 중 상태로 표시
-      logs: [...prev.logs, "[스캔] 문서 내 이미지를 분석 중..."],
+      logs: [...prev.logs, log("스캔", "문서 내 이미지를 분석 중...")],
     }));
 
     try {
@@ -218,8 +284,8 @@ export default function HwpImageConverter() {
           totalCount: data.images.length,
           logs: [
             ...prev.logs,
-            `[스캔 완료] 전체 ${data.images.length}개 이미지 (${summary})`,
-            `[대상] 변환 대상: ${targetCount}개`,
+            log("스캔 완료", `전체 ${data.images.length}개 이미지 (${summary})`),
+            log("대상", `변환 대상: ${targetCount}개`),
           ],
         }));
 
@@ -230,7 +296,7 @@ export default function HwpImageConverter() {
           setState((prev) => ({
             ...prev,
             status: "success",
-            logs: [...prev.logs, "[안내] 변환 대상 이미지가 없습니다."],
+            logs: [...prev.logs, log("안내", "변환 대상 이미지가 없습니다.")],
           }));
         }
       } else {
@@ -260,7 +326,7 @@ export default function HwpImageConverter() {
       status: "converting",
       convertedCount: 0,
       skippedCount: 0,
-      logs: [...prev.logs, `[시작] ${state.fileName} 이미지 변환을 시작합니다...`],
+      logs: [...prev.logs, log("시작", `${state.fileName} 이미지 변환을 시작합니다...`)],
     }));
 
     try {
@@ -278,7 +344,8 @@ export default function HwpImageConverter() {
       let skippedCount = 0;
       let outputDir = "";
       let outputPath = "";
-      let logs = [...state.logs, `[시작] ${state.fileName} 이미지 변환을 시작합니다...`]; // 상태가 클로저에 묶이지 않도록 여기서 추가
+      // 상태가 클로저에 묶이지 않도록 여기서 추가
+      let logs = [...state.logs, log("시작", `${state.fileName} 이미지 변환을 시작합니다...`)];
 
       let buffer = ""; // NDJSON 한 줄이 청크 경계에서 잘려도 이어붙이도록 버퍼링
       while (true) {
@@ -293,14 +360,22 @@ export default function HwpImageConverter() {
             const data = JSON.parse(line);
 
             if (data.event === "progress") {
+              const pageInfo = {
+                withPage: true,
+                page: data.page as number | undefined,
+                pages: data.pages as number[] | undefined,
+              };
               if (data.success) {
                 converted++;
-                logs = [...logs, `[성공] ${data.name}: ${data.from} → ${data.to}`];
+                logs = [
+                  ...logs,
+                  log("성공", `${data.name}: ${data.from} → ${data.to}`, "success", pageInfo),
+                ];
               } else {
                 skippedCount++;
                 logs = [
                   ...logs,
-                  `[실패] ${data.name}: ${data.message || "알 수 없는 오류"}`,
+                  log("실패", `${data.name}: ${data.message || "알 수 없는 오류"}`, "fail", pageInfo),
                 ];
               }
               setState((prev) => ({
@@ -312,24 +387,31 @@ export default function HwpImageConverter() {
             } else if (data.event === "done") {
               logs = [
                 ...logs,
-                `[완료] 변환 ${data.totalConverted}건 / 건너뜀 ${data.totalSkipped}건`,
+                log("완료", `변환 ${data.totalConverted}건 / 건너뜀 ${data.totalSkipped}건`),
               ];
               setState((prev) => ({ ...prev, logs }));
             } else if (data.event === "size") {
-              logs = [...logs, `[사이즈] ${data.name ? `${data.name}: ` : ""}${data.message}`];
+              logs = [
+                ...logs,
+                log("사이즈", `${data.name ? `${data.name}: ` : ""}${data.message}`, "size", {
+                  withPage: true,
+                  page: data.page as number | undefined,
+                  pages: data.pages as number[] | undefined,
+                }),
+              ];
               setState((prev) => ({ ...prev, logs }));
             } else if (data.event === "sizeDone") {
               logs = [
                 ...logs,
-                `[사이즈 완료] 조정 ${data.adjusted}건 / 건너뜀 ${data.skipped}건`,
+                log("사이즈 완료", `조정 ${data.adjusted}건 / 건너뜀 ${data.skipped}건`),
               ];
               setState((prev) => ({ ...prev, logs }));
             } else if (data.event === "complete") {
               outputDir = data.outputDir || "";
               outputPath = data.outputPath || "";
-              logs = [...logs, `[저장] ${outputPath}`];
+              logs = [...logs, log("저장", outputPath)];
             } else if (data.event === "error") {
-              logs = [...logs, `[오류] ${data.error}`];
+              logs = [...logs, log("오류", data.error, "fail")];
             }
           } catch {
             // 잘못된 JSON 라인은 무시
@@ -584,7 +666,7 @@ export default function HwpImageConverter() {
               <div className="flex flex-wrap items-center justify-center gap-2">
                 <span
                   className={`flex items-center gap-1 font-bold text-sm ${
-                    state.skippedCount === 0 ? "text-teal-400" : "text-amber-400"
+                    state.skippedCount === 0 ? "text-teal-400" : "text-red-400"
                   }`}
                 >
                   {state.skippedCount === 0 ? (
@@ -598,8 +680,8 @@ export default function HwpImageConverter() {
                   성공 {state.convertedCount}
                 </span>
                 {state.skippedCount > 0 && (
-                  <span className="bg-amber-500/10 text-amber-300 px-2.5 py-1 rounded-lg text-xs font-semibold">
-                    건너뜀 {state.skippedCount}
+                  <span className="bg-red-500/15 text-red-300 ring-1 ring-red-400/30 px-2.5 py-1 rounded-lg text-xs font-semibold">
+                    실패 {state.skippedCount}
                   </span>
                 )}
               </div>
@@ -623,8 +705,10 @@ export default function HwpImageConverter() {
           <div className="flex-1 min-h-0 bg-black/30 border border-white/5 rounded-xl p-3 overflow-auto terminal-scroll font-mono text-[11px] leading-relaxed">
             {state.logs.length ? (
               state.logs.map((l, i) => (
-                <div key={i} className="text-slate-300 whitespace-pre-wrap break-all">
-                  {l}
+                <div key={i} className={`flex items-baseline gap-1.5 ${LOG_STYLES[l.tone].row}`}>
+                  <span className={`shrink-0 ${LOG_STYLES[l.tone].tag}`}>[{l.tag}]</span>
+                  {l.withPage && <PageChip page={l.page} pages={l.pages} tone={l.tone} />}
+                  <span className="whitespace-pre-wrap break-all">{l.text}</span>
                 </div>
               ))
             ) : (

@@ -35,7 +35,7 @@ Notes:
 These are committed under `resources/` but are large/generated. Rebuild whenever the corresponding Python source changes (the app uses the **exe even in dev** when it exists):
 - **Ghostscript**: `node download_gs.mjs` downloads the GS 10.03.1 Windows installer and 7-Zip-extracts it into `resources/ghostscript/` (provides `bin/gswin64c.exe`). Not wired into any npm script.
 - **Image worker**: `cd python_worker && build_worker.bat` → PyInstaller onefile → `resources/image_worker/image_worker.exe`. Requires Python (32-bit 3.11 in use) + Pillow.
-- **HWP worker**: `cd python_worker && build_hwp_worker.bat` → `resources/hwp_worker/hwp_worker.exe`. Requires pywin32 + olefile + Pillow. **Hidden imports are load-bearing** — see "Packaging the worker" below. The `.bat` files can garble in non-cp949 shells; the equivalent direct command is `python -m PyInstaller --onefile --name hwp_worker --distpath dist --noconfirm --hidden-import pythoncom --hidden-import pywintypes --hidden-import win32timezone --hidden-import win32com --hidden-import win32com.client --hidden-import worker hwp_worker.py`.
+- **HWP worker**: `cd python_worker && build_hwp_worker.bat` → `resources/hwp_worker/hwp_worker.exe`. Requires pywin32 + olefile + Pillow. **Hidden imports are load-bearing** — see "Packaging the worker" below. The `.bat` files can garble in non-cp949 shells; the equivalent direct command is `python -m PyInstaller --onefile --name hwp_worker --distpath dist --noconfirm --hidden-import pythoncom --hidden-import pywintypes --hidden-import win32timezone --hidden-import win32com --hidden-import win32com.client --hidden-import worker --hidden-import hwp_pagemap hwp_worker.py`.
 
 ## Architecture
 
@@ -53,7 +53,7 @@ Key endpoints (legacy ones live inline in `server.ts`; new utilities mount via `
 - `POST /api/compress` — multer disk upload; runs the Ghostscript size-targeting loop (see below).
 - `POST /api/image/scan` — recursively walks dropped file/folder **paths** and returns matching image files; the `options` flags toggle whether jpg/bmp/emf are *included* (png/tif/svg/wmf/webp etc. are always in).
 - `POST /api/image/convert-batch` — spawns the Python image worker and **streams NDJSON** progress lines back (`Content-Type: application/x-ndjson`).
-- `POST /api/hwp-image/scan` / `POST /api/hwp-image/convert` (`api-modules/hwpImage.ts`) — spawn the HWP worker; convert streams NDJSON and finishes with a `complete` event carrying `outputPath`/`outputDir`. Output is written beside the original as `변환_<name>.hwp(x)`.
+- `POST /api/hwp-image/scan` / `POST /api/hwp-image/convert` (`api-modules/hwpImage.ts`) — spawn the HWP worker; convert streams NDJSON and finishes with a `complete` event carrying `outputPath`/`outputDir`. Output is written beside the original as `변환_<name>.hwp(x)`. `progress`/`size` lines also carry `page` (1-based, the page the image sits on in the original document) and `pages` when one image is placed in several spots — see "Image → page mapping".
 - `POST /api/image/convert` — legacy single-file upload fallback path.
 - `GET /api/download/:filename` — serves a temp file once, then deletes it (with a directory-traversal guard against `tempDir`).
 - `POST /api/close` / `POST /api/minimize` — window controls; `minimize` dynamically `require("electron")` so the server still runs as plain Node.
@@ -75,6 +75,7 @@ Standalone PyInstaller exes invoked by the server via `execFile`/`spawn`; both p
 
 - **`worker.py`** (이미지 변환기): Pillow for normal formats, **Windows GDI/GDI+ via `ctypes`** to rasterize `.wmf`/`.emf` — this is why the app is Windows-only. Accepts `--input` or `--input-json` (batch), `--output`, `--dpi`, `--uppercase`.
 - **`hwp_worker.py`** (삽입그림 정리기): `--input`, `--output`, `--mode selective|all`, `--scan`, `--size-adjust`. Two processors chosen by magic bytes: `HwpProcessor` (HWP 5.0 OLE compound file, via pythoncom `StgOpenStorage` on a temp copy) and `HwpxProcessor` (HWPX ZIP, 한글 2022). It imports `worker.py` for all metafile rendering. The frontend default option is **전체 정리 (JPG+사이즈)** (`mode=all`, `sizeAdjust=true`).
+- **`hwp_pagemap.py`** (쪽 번호 계산): read-only helper imported by `hwp_worker.py`; maps each image to the page it sits on so progress/size NDJSON lines carry `page` (and `pages` when the same image is placed more than once). Guarded import with no-op fallbacks — a bundling failure must never break conversion. See "Image → page mapping" below.
 
 ### Native binary path resolution (important pattern)
 
@@ -82,7 +83,7 @@ Standalone PyInstaller exes invoked by the server via `execFile`/`spawn`; both p
 
 ### Frontend (`src/`)
 
-Vite + React 19 + React Router + Tailwind v4 + `lucide-react`. Pages live in `src/pages/`; all talk to the server purely over `fetch` to relative `/api/*` URLs. Each page is a 4-panel layout (sidebar + 옵션 / 파일드롭 / 진행및결과), where the file-drop and progress-result panels are stacked vertically and the progress-result panel has a terminal-style log window; every panel has its own reset button. (`motion` is still a dependency but no longer imported by the pages.)
+Vite + React 19 + React Router + Tailwind v4 + `lucide-react`. Pages live in `src/pages/`; all talk to the server purely over `fetch` to relative `/api/*` URLs. Each page is a 4-panel layout (sidebar + 옵션 / 파일드롭 / 진행및결과), where the file-drop and progress-result panels are stacked vertically and the progress-result panel has a terminal-style log window; every panel has its own reset button. In 삽입그림 정리기 the log is a `LogEntry[]` (tag/text/tone + optional page), not plain strings: failures and errors render in red with a left band, and image lines lead with a pill-shaped page chip (`03p`, `22p+` for multi-placement, gray `?p` when unplaced). (`motion` is still a dependency but no longer imported by the pages.)
 
 **Portal module convention (how to add a utility)**: the sidebar + routing in `src/App.tsx` are data-driven from `src/modules/registry.tsx` (one `UtilityModule` entry per utility — `id`/`path`/`label`/`icon`/`accent`/`Component`). Routing uses `useRoutes`. The backend mirror is `api-modules/registry.ts`: each `ApiModule` exposes a `register(app)` that mounts its `/api/*` routes, mounted by `registerModules(app)` in `server.ts`. The 삽입그림 정리기 (`src/pages/HwpImageConverter.tsx` + `api-modules/hwpImage.ts`) is the reference implementation of this convention. Full checklist: `docs/유틸리티_추가_가이드.md`.
 
@@ -121,6 +122,17 @@ Post-conversion pass (the "JPG+사이즈" options; **default**). It downsizes on
 - **WMF re-render instead of downsample**: LANCZOS-downsampling a big render fades thin vector lines to gray (black 0 → ~197); `render_wmf_window_px` re-renders the vector small and crisp (display size × 2.0 oversample, DPI set to match).
 - **HWPX** (`size_adjust_hwpx`, separate pass on the output zip): `curSz` from `<hp:curSz>`, clip from `<hp:imgClip>`/`<hp:imgDim>` (a resolution-independent fraction → immune to pixel changes).
 - **OLE** (`size_adjust_jpg_for_record`, inline during the COM session): `curSz` from BodyText Tag 76 offset 28/32 via read-only `read_ole_picture_info` (olefile) before the COM write. **OLE resizes only *uncropped* pictures** (off44 == full native rect, 3% tolerance): a cropped picture's off44 is in px×75, so shrinking the JPG would point it outside the image. Cropped pictures usually read below 300 dpi anyway. EMF is skipped.
+
+### Image → page mapping (`hwp_pagemap.py`)
+
+Every conversion log line carries the page the image sits on in the *original* document (`[성공] 03p BIN0003.jpg`), so a failed or suspicious image can be found in 한글 immediately. Nothing in HWP/HWPX stores "this picture is on page 12" — it is derived from 한글's own **layout cache**:
+
+- Each body paragraph stores its line list (OLE Tag 69 `PARA_LINE_SEG` / HWPX `<hp:linesegarray>`), and each line records its vertical position **within its page**. A page break is where the next line's `vertpos` **drops**; additionally a paragraph flagged 쪽 나누기 (OLE para-header byte 11 `& 0x04` / HWPX `pageBreak="1"`) starts a page when the drop rule did not already fire; each new section starts a page.
+- **Anchor, not record order**: pictures are located by their **character position in the paragraph** — objects occupy 8 chars in the text stream (extended control chars), and a line's `textpos` indexes the same stream, so the last line with `textpos <= 개체위치` is the image's line. This is load-bearing for 교재-style documents where dozens of floating images hang off *one* paragraph spanning dozens of pages; counting in record order puts every image on the last page.
+- Only **top-level** paragraph lines drive page counting (level 1 in OLE, direct `<hp:p>` children of `<hs:sec>` in HWPX). Images inside a table/group inherit the page of the enclosing object, so a table spanning pages reports its start page.
+- Read-only and failure-tolerant: OLE goes through `olefile` **before** the COM write session (same rule as `read_ole_picture_info`), HWPX reads the input zip; any exception yields an empty map and conversion proceeds with no page chips.
+
+Accuracy (measured against 한글-exported PDFs, `D:\작업방`): 교재 documents 46/46 and 150/150 pages exact; a footnote- and table-heavy 연구보고서 153/160 (~5% short — multi-page tables cannot be counted, since cell paragraphs use their own coordinate frame). **Treat it as a guide, not an exact locator.** Images with no body placement (쪽 배경, orphaned `BinData` left over from editing) carry no page and the UI shows a gray `?p`.
 
 ### Packaging the worker (`build_hwp_worker.bat`)
 

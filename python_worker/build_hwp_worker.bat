@@ -13,6 +13,8 @@ REM 함수 안에서 지연 import되어 PyInstaller 정적 분석이 놓칠 수
 REM 특히 win32timezone: IStorage 열거 시 enum.Next()가 STATSTG의 시간 필드를 변환하며
 REM win32timezone를 지연 import하는데, 이게 빠지면 빌드는 되지만 런타임에 열거가 실패해
 REM 스캔이 0개로 나오고 변환도 0개가 된다(앱에서 "이미지 0개"의 실제 원인이었음).
+REM hwp_pagemap(그림별 쪽 번호 계산)은 최상위 import라 정적 분석에 잡히지만,
+REM 빠지면 로그의 쪽 칩만 조용히 사라지므로 함께 명시해 둔다.
 pyinstaller --onefile --name hwp_worker --distpath dist ^
     --hidden-import pythoncom ^
     --hidden-import pywintypes ^
@@ -20,6 +22,7 @@ pyinstaller --onefile --name hwp_worker --distpath dist ^
     --hidden-import win32com ^
     --hidden-import win32com.client ^
     --hidden-import worker ^
+    --hidden-import hwp_pagemap ^
     hwp_worker.py
 
 if errorlevel 1 (
