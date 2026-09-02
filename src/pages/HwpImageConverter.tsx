@@ -11,7 +11,8 @@ import {
 
 /* ─────────────── 타입 ─────────────── */
 
-type ImageInfo = { name: string; format: string; size: number };
+/** used=false면 문서가 참조하지 않는 그림이라 변환에서 제외됩니다. */
+type ImageInfo = { name: string; format: string; size: number; used?: boolean };
 
 type ConvertMode = "selective" | "all";
 
@@ -31,6 +32,7 @@ type LogEntry = {
   page?: number;          // 문서에 인쇄되는 쪽 번호
   physicalPage?: number;  // 문서의 몇 번째 쪽 ('새 번호로 시작' 때문에 다를 때만)
   pages?: number[];       // 같은 그림이 여러 곳에 쓰인 경우
+  pageNote?: string;      // 쪽을 못 매기는 쓰임새('채우기' 등)
 };
 
 const log = (
@@ -100,8 +102,10 @@ const DEFAULT_OPTION: OptionId = "all-size";
 const EXCLUDE_SELECTIVE = new Set(["jpg", "jpeg", "bmp", "emf"]);
 
 function countTargets(images: ImageInfo[], mode: ConvertMode): number {
-  if (mode === "all") return images.length;
-  return images.filter((img) => !EXCLUDE_SELECTIVE.has(img.format)).length;
+  // 문서가 참조하지 않는 그림은 워커가 건드리지 않으므로 대상 수에서도 뺀다.
+  const used = images.filter((img) => img.used !== false);
+  if (mode === "all") return used.length;
+  return used.filter((img) => !EXCLUDE_SELECTIVE.has(img.format)).length;
 }
 
 function formatBytes(bytes: number): string {
@@ -137,20 +141,25 @@ function PageChip({
   page,
   physicalPage,
   pages,
+  pageNote,
   tone,
 }: {
   page?: number;
   physicalPage?: number;
   pages?: number[];
+  pageNote?: string;
   tone: LogTone;
 }) {
   if (typeof page !== "number") {
+    // 쪽을 매길 수 없는 쓰임새(문단·표의 그림 채우기, 그림 글머리표, 바탕쪽 등).
+    // 실제로 쓰이는 그림이므로 변환은 그대로 하고, 어디에 쓰이는지만 알려 줍니다.
+    if (!pageNote) return null;
     return (
       <span
-        title="본문에서 위치를 찾지 못했습니다 — 편집 중 지워진 그림의 잔여 데이터이거나 바탕쪽·배경 그림일 수 있습니다"
-        className={`${CHIP_BASE} bg-white/5 text-slate-500 ring-white/10`}
+        title="특정 쪽이 아니라 문서 전체에서 쓰이는 그림입니다 (문단·표의 그림 채우기, 그림 글머리표, 바탕쪽 등)"
+        className={`${CHIP_BASE} bg-sky-400/10 text-sky-200/80 ring-sky-400/20`}
       >
-        미배치
+        {pageNote}
       </span>
     );
   }
@@ -380,6 +389,7 @@ export default function HwpImageConverter() {
                 page: data.page as number | undefined,
                 physicalPage: data.physicalPage as number | undefined,
                 pages: data.pages as number[] | undefined,
+                pageNote: data.pageNote as string | undefined,
               };
               if (data.success) {
                 converted++;
@@ -414,7 +424,20 @@ export default function HwpImageConverter() {
                   page: data.page as number | undefined,
                   physicalPage: data.physicalPage as number | undefined,
                   pages: data.pages as number[] | undefined,
+                  pageNote: data.pageNote as string | undefined,
                 }),
+              ];
+              setState((prev) => ({ ...prev, logs }));
+            } else if (data.event === "unused") {
+              const names = (data.names as string[] | undefined) ?? [];
+              const shown = names.slice(0, 5).join(", ");
+              const more = data.count > names.length ? ` 외 ${data.count - names.length}개` : "";
+              logs = [
+                ...logs,
+                log(
+                  "제외",
+                  `문서가 사용하지 않는 그림 ${data.count}개는 변환하지 않았습니다 (${shown}${more})`
+                ),
               ];
               setState((prev) => ({ ...prev, logs }));
             } else if (data.event === "sizeDone") {
@@ -729,6 +752,7 @@ export default function HwpImageConverter() {
                       page={l.page}
                       physicalPage={l.physicalPage}
                       pages={l.pages}
+                      pageNote={l.pageNote}
                       tone={l.tone}
                     />
                   )}

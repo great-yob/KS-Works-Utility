@@ -26,23 +26,44 @@ from PIL import Image
 # 프리즈된 exe에서 번들이 누락돼도 변환 자체는 계속돼야 하므로 실패를 흡수한다.
 try:
     from hwp_pagemap import (
+        PageMap,
         build_page_map_hwp,
         build_page_map_hwpx,
+        is_unused_hwp,
+        is_unused_hwpx,
         lookup_hwp,
         lookup_hwpx,
+        note_hwp,
+        note_hwpx,
     )
 except Exception:                                   # pragma: no cover - 방어적 폴백
+    class PageMap:                                  # ok=False → 아무것도 제외하지 않는다
+        def __init__(self):
+            self.pages, self.used, self.notes, self.ok = {}, set(), {}, False
+
     def build_page_map_hwp(path):
-        return {}
+        return PageMap()
 
     def build_page_map_hwpx(path):
-        return {}
+        return PageMap()
 
     def lookup_hwp(page_map, name):
         return None
 
     def lookup_hwpx(page_map, name):
         return None
+
+    def note_hwp(page_map, name):
+        return None
+
+    def note_hwpx(page_map, name):
+        return None
+
+    def is_unused_hwp(page_map, name):
+        return False
+
+    def is_unused_hwpx(page_map, name):
+        return False
 
 # ─────────────────────────────────────────
 # 이미지 형식 감지 (바이너리 시그니처)
@@ -725,8 +746,9 @@ class HwpProcessor:
         return bytes(out)
 
     def scan(self, hwp_path: str) -> list:
-        """HWP 파일 내 이미지 목록을 반환합니다."""
+        """HWP 파일 내 이미지 목록을 반환합니다. used=False면 변환에서 제외될 그림입니다."""
         images = []
+        page_map = build_page_map_hwp(hwp_path)
         self._current_tmp_path = None
         try:
             storage = self._open_storage(hwp_path, read_only=True)
@@ -751,6 +773,7 @@ class HwpProcessor:
                         "name": name,
                         "format": fmt,
                         "size": len(uncomp_data),
+                        "used": not is_unused_hwp(page_map, name),
                     })
                 except Exception:
                     pass
@@ -804,13 +827,21 @@ class HwpProcessor:
         stream_names = self._enum_bindata_streams(bindata)
         converted = 0
         skipped = 0
+        unused_names = []          # 문서가 참조하지 않아 변환에서 제외한 그림
 
         conversions = {}
         stream_renames = []
 
         for name in stream_names:
+            # 문서 어디에서도 안 쓰이는 그림(편집 중 지운 그림의 잔여 BinData)은 건드리지
+            # 않는다. 판정은 본문 그림 + 그림 채우기 + 그림 글머리표를 모두 본 뒤에만 참이며,
+            # 해석이 조금이라도 어긋나면 항상 False가 되어 실제 그림이 빠지지 않는다.
+            if is_unused_hwp(page_map, name):
+                unused_names.append(name)
+                continue
             # 성공·실패 어느 쪽이든 로그에 쪽을 붙일 수 있도록 먼저 조회해 둔다.
             pages = lookup_hwp(page_map, name)
+            note = note_hwp(page_map, name)
             try:
                 data = self._read_stream(bindata, name)
                 uncomp_data, comp_type = self._decompress(data)
@@ -827,7 +858,7 @@ class HwpProcessor:
                 try:
                     jpg_data = image_bytes_to_jpg(uncomp_data, fmt)
                 except Exception as e:
-                    emit_progress(False, name, fmt, "jpg", f"변환 실패: {e}", pages)
+                    emit_progress(False, name, fmt, "jpg", f"변환 실패: {e}", pages, note)
                     skipped += 1
                     continue
 
@@ -846,13 +877,13 @@ class HwpProcessor:
                             _print_json({"event": "size", "name": name,
                                          "message": f"사이즈 조정: 표시 {round(eff)}dpi "
                                                     f"(용량 {before_kb}KB→{len(jpg_data)//1024}KB)",
-                                         **_page_fields(pages)})
+                                         **_page_fields(pages, note)})
                         else:
                             size_skipped += 1
                     except Exception as e:
                         size_skipped += 1
                         _print_json({"event": "size", "name": name,
-                                     "message": f"사이즈 조정 실패: {e}", **_page_fields(pages)})
+                                     "message": f"사이즈 조정 실패: {e}", **_page_fields(pages, note)})
 
                 # 압축 유지
                 jpg_data_out = self._compress(jpg_data, comp_type)
@@ -868,10 +899,10 @@ class HwpProcessor:
                         stream_renames.append((name, new_name))
 
                 converted += 1
-                emit_progress(True, name, fmt, "jpg", "변환 완료", pages)
+                emit_progress(True, name, fmt, "jpg", "변환 완료", pages, note)
 
             except Exception as e:
-                emit_progress(False, name, "unknown", "jpg", f"처리 오류: {e}", pages)
+                emit_progress(False, name, "unknown", "jpg", f"처리 오류: {e}", pages, note)
                 skipped += 1
 
         # 모든 스트림 변환 완료 후 DocInfo 일괄 패치
@@ -912,6 +943,7 @@ class HwpProcessor:
             except Exception as e:
                 emit_error(f"최종 파일 저장 실패: {e}")
 
+        emit_unused(unused_names)
         emit_done(converted, skipped)
         if size_adjust:
             _print_json({"event": "sizeDone", "adjusted": size_adjusted, "skipped": size_skipped})
@@ -943,8 +975,9 @@ class HwpxProcessor:
         return ext if ext else "unknown"
 
     def scan(self, hwpx_path: str) -> list:
-        """HWPX 파일 내 이미지 목록을 반환합니다."""
+        """HWPX 파일 내 이미지 목록을 반환합니다. used=False면 변환에서 제외될 그림입니다."""
         images = []
+        page_map = build_page_map_hwpx(hwpx_path)
         try:
             with zipfile.ZipFile(hwpx_path, "r") as zf:
                 entries = self._find_bindata_entries(zf)
@@ -958,6 +991,7 @@ class HwpxProcessor:
                         "name": Path(entry).name,
                         "format": fmt,
                         "size": len(data),
+                        "used": not is_unused_hwpx(page_map, entry),
                     })
         except Exception as e:
             emit_error(f"HWPX 스캔 실패: {e}")
@@ -970,6 +1004,7 @@ class HwpxProcessor:
 
         converted = 0
         skipped = 0
+        unused_names = []          # 문서가 참조하지 않아 변환에서 제외한 그림
         # 변환 대상 매핑: {원래 ZIP 경로: (새 ZIP 경로, jpg 바이트)}
         replacements: dict[str, tuple[str, bytes]] = {}
         # 이름 변경 매핑: {원래 파일명: 새 파일명} (XML 참조 수정용)
@@ -990,7 +1025,11 @@ class HwpxProcessor:
                     fmt = self._get_format_from_name(entry)
 
                 original_name = Path(entry).name
+                if is_unused_hwpx(self.page_map, entry):
+                    unused_names.append(original_name)   # 참조 없는 잔여 이미지 → 손대지 않음
+                    continue
                 pages = lookup_hwpx(self.page_map, entry)
+                note = note_hwpx(self.page_map, entry)
 
                 if not should_convert(fmt, mode):
                     skipped += 1
@@ -999,7 +1038,7 @@ class HwpxProcessor:
                 try:
                     jpg_data = image_bytes_to_jpg(data, fmt)
                 except Exception as e:
-                    emit_progress(False, original_name, fmt, "jpg", f"변환 실패: {e}", pages)
+                    emit_progress(False, original_name, fmt, "jpg", f"변환 실패: {e}", pages, note)
                     skipped += 1
                     continue
 
@@ -1014,7 +1053,9 @@ class HwpxProcessor:
                     self.vector_origins[new_entry] = (fmt, data)
 
                 converted += 1
-                emit_progress(True, original_name, fmt, "jpg", "변환 완료", pages)
+                emit_progress(True, original_name, fmt, "jpg", "변환 완료", pages, note)
+
+        emit_unused(unused_names)
 
         if not replacements:
             emit_done(converted, skipped)
@@ -1096,7 +1137,7 @@ def _print_json(data: dict):
     sys.stdout.buffer.flush()
 
 def emit_progress(success: bool, name: str, from_fmt: str, to_fmt: str, message: str,
-                  pages: list = None):
+                  pages: list = None, note: str = None):
     """진행 상황 1건. pages는 그림이 놓인 쪽 목록(문서 순서) — 없으면 필드를 생략한다."""
     data = {
         "event": "progress",
@@ -1106,19 +1147,20 @@ def emit_progress(success: bool, name: str, from_fmt: str, to_fmt: str, message:
         "to": to_fmt,
         "message": message,
     }
-    data.update(_page_fields(pages))
+    data.update(_page_fields(pages, note))
     _print_json(data)
 
 
-def _page_fields(pages: list) -> dict:
+def _page_fields(pages: list, note: str = None) -> dict:
     """쪽 정보를 NDJSON 필드로 만듭니다. pages는 [(인쇄 번호, 물리 쪽), ...].
 
     page          = 문서에 인쇄되는 쪽 번호(사용자가 한글에서 보는 번호)
     physicalPage  = 문서의 몇 번째 쪽인지. '새 번호로 시작' 때문에 다를 때만 넣는다.
     pages         = 같은 그림이 여러 곳에 쓰였을 때 인쇄 번호 전체
+    pageNote      = 쪽을 못 매기는 쓰임새('채우기' 등). 쪽이 없을 때만.
     """
     if not pages:
-        return {}
+        return {"pageNote": note} if note else {}
     display, physical = pages[0]
     out = {"page": display}
     if physical != display:
@@ -1126,6 +1168,12 @@ def _page_fields(pages: list) -> dict:
     if len(pages) > 1:
         out["pages"] = [d for d, _ in pages]
     return out
+
+def emit_unused(names: list):
+    """문서가 참조하지 않아 변환에서 제외한 그림 목록(있을 때만)."""
+    if names:
+        _print_json({"event": "unused", "count": len(names), "names": names[:30]})
+
 
 def emit_done(total_converted: int, total_skipped: int):
     _print_json({

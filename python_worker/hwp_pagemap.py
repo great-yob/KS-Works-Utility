@@ -45,6 +45,20 @@ EXTENDED_CTRL_CODES = {1, 2, 3, 11, 12, 14, 15, 16, 17, 18, 21, 22, 23}
 INLINE_CTRL_CODES = {4, 5, 6, 7, 8, 9, 19, 20}
 CTRL_CHAR_WIDTH = 8
 
+# DocInfo 레코드 태그 (본문 밖 그림 참조를 찾기 위한 것)
+TAG_BORDER_FILL = 20
+TAG_BULLET = 24
+
+# 쪽을 못 매기는 쓰임새(로그 칩에 그대로 표시된다)
+REASON_FILL = "채우기"        # 문단·표의 그림 채우기(배경)
+REASON_BULLET = "글머리"      # 그림 글머리표
+REASON_OUTSIDE = "본문 밖"    # HWPX 바탕쪽·머리말 등 구역 XML 밖의 참조
+
+# 채우기 종류 비트 (BORDER_FILL의 채우기 정보)
+FILL_SOLID = 1
+FILL_IMAGE = 2
+FILL_GRADIENT = 4
+
 # BodyText 레코드 태그
 TAG_PARA_HEADER = 66
 TAG_PARA_TEXT = 67
@@ -109,10 +123,58 @@ class _Numbering:
         return physical_page + self.offset
 
 
-def _add(page_map: dict, key, page: int, numbering: "_Numbering"):
+class PageMap:
+    """그림 위치 조회 결과.
+
+    pages : 키 → [(인쇄 번호, 물리 쪽), ...]  — 본문에 배치돼 쪽을 특정할 수 있는 그림
+    used  : 쪽은 몰라도 **문서가 참조하고 있는** 키 전부. 본문 그림에 더해 그림 채우기
+            (문단·표 배경), 그림 글머리표, 바탕쪽/머리말 등 쪽으로 환산할 수 없는 참조까지
+            포함한다. '변환에서 제외해도 되는가'는 오직 이 집합으로 판단한다.
+    ok    : 참조 수집이 정상적으로 끝났는가. False면 어떤 그림도 미사용으로 단정하지 않는다.
+    """
+
+    def __init__(self):
+        self.pages: dict = {}
+        self.used: set = set()
+        self.notes: dict = {}       # 키 → 쪽을 못 매기는 쓰임새('채우기' 등)
+        self.ok: bool = False
+
+    def lookup(self, *keys):
+        for key in keys:
+            found = self.pages.get(key)
+            if found:
+                return found
+        return None
+
+    def note(self, *keys):
+        """쪽은 없지만 쓰이고 있는 그림의 쓰임새. 본문 그림이거나 미사용이면 None."""
+        for key in keys:
+            if key in self.pages:
+                return None
+            if key in self.notes:
+                return self.notes[key]
+        return None
+
+    def mark_used(self, key, reason: str):
+        self.used.add(key)
+        self.notes.setdefault(key, reason)
+
+    def is_unused(self, *keys) -> bool:
+        """문서 어디에서도 참조되지 않는 그림인가(= 변환에서 빼도 되는가).
+
+        ⚠ 수집이 실패했거나(ok=False) 참조를 하나라도 찾으면 반드시 False. 실제로 쓰이는
+        그림을 건너뛰는 쪽이 쓰레기 한 장을 변환하는 쪽보다 훨씬 나쁘기 때문에, 애매하면
+        항상 '사용 중'으로 본다."""
+        if not self.ok:
+            return False
+        return not any(key in self.used for key in keys)
+
+
+def _add(page_map: PageMap, key, page: int, numbering: "_Numbering"):
     """그림 1장의 위치를 (인쇄 번호, 물리 쪽) 쌍으로 기록합니다."""
     entry = (numbering.display(page), page)
-    pages = page_map.setdefault(key, [])
+    page_map.used.add(key)
+    pages = page_map.pages.setdefault(key, [])
     if len(pages) < MAX_PAGES_PER_IMAGE and (not pages or pages[-1] != entry):
         pages.append(entry)
 
@@ -140,19 +202,19 @@ def _ctrl_char_positions(para_text: bytes) -> list:
     return positions
 
 
-def build_page_map_hwp(hwp_path: str) -> dict:
-    """HWP(OLE)의 bin id → [(인쇄 번호, 물리 쪽), ...]. 실패 시 {}."""
+def build_page_map_hwp(hwp_path: str) -> PageMap:
+    """HWP(OLE)의 bin id → 쪽/사용 여부. 실패하면 비어 있는(ok=False) PageMap."""
     import zlib
+    page_map = PageMap()
     try:
         import olefile
     except Exception:
-        return {}
+        return page_map
     try:
         ole = olefile.OleFileIO(hwp_path)
     except Exception:
-        return {}
+        return page_map
 
-    page_map: dict = {}
     try:
         sections = [n for n in ole.listdir()
                     if len(n) >= 2 and n[0] == "BodyText" and n[1].startswith("Section")]
@@ -223,14 +285,75 @@ def build_page_map_hwp(hwp_path: str) -> dict:
                         _add(page_map, bin_id, current_page, numbering)
 
             page += 1               # 다음 구역은 새 쪽에서 시작
+
+        # 본문 밖 참조(그림 채우기·그림 글머리표)까지 모아야 '미사용' 판단이 안전해진다.
+        _collect_docinfo_refs(ole, page_map)
+        page_map.ok = True
     except Exception:
-        return page_map
+        page_map.ok = False         # 중간에 깨졌으면 아무것도 미사용으로 보지 않는다
     finally:
         try:
             ole.close()
         except Exception:
             pass
     return page_map
+
+
+def _collect_docinfo_refs(ole, page_map: PageMap):
+    """DocInfo에서 '쪽으로 환산할 수 없는' 그림 참조를 모읍니다.
+
+    실측(2026-09, 한국공인회계사회 실무해설 내지): BinData 148개 중 106개가 본문 그림이
+    아니라 **문단·표의 그림 채우기**(HWPTAG_BORDER_FILL)였다. 본문만 보고 미사용으로
+    판단했다면 실제로 쓰이는 배경 그림 106장이 통째로 변환에서 빠졌을 것이다.
+
+    BORDER_FILL 레이아웃: 속성(2) + 4방향 테두리(각 6) + 대각선(6) = 32바이트 뒤부터
+    채우기 정보. 채우기 종류(4)는 비트 조합(1=단색, 2=이미지, 4=그러데이션)이고, 단색이
+    함께 켜져 있으면 색 정보 12바이트가 앞에 붙는다. 이미지 채우기는
+    유형(1)+밝기(1)+명암(1)+효과(1)+BinItem ID(2) 순서다.
+
+    그러데이션이 섞이면 길이가 가변이라 위치를 특정할 수 없다. 그럴 때와 글머리표
+    (BULLET/NUMBERING)처럼 배치가 확실치 않은 레코드는 **레코드 안의 모든 UINT16을 참조로
+    간주**한다 — 실제보다 넓게 잡히지만, 쓰이는 그림을 빠뜨리지 않는 안전한 방향이다."""
+    import zlib
+    try:
+        raw = ole.openstream("DocInfo").read()
+    except Exception:
+        raise                        # DocInfo를 못 읽으면 ok=False로 떨어뜨린다
+    try:
+        data = zlib.decompress(raw, -15)
+    except Exception:
+        try:
+            data = zlib.decompress(raw)
+        except Exception:
+            data = raw
+
+    for tag, _level, rec in _iter_records(data):
+        if tag == TAG_BORDER_FILL and len(rec) >= 36:
+            fill_type = struct.unpack_from("<I", rec, 32)[0]
+            if not (fill_type & FILL_IMAGE):
+                continue
+            if fill_type & FILL_GRADIENT:
+                _mark_all_uint16(rec, page_map, REASON_FILL)   # 길이 가변 → 넓게 잡는다
+                continue
+            pos = 36 + (12 if fill_type & FILL_SOLID else 0)
+            if pos + 6 <= len(rec):
+                page_map.mark_used(struct.unpack_from("<H", rec, pos + 4)[0], REASON_FILL)
+            else:
+                _mark_all_uint16(rec, page_map, REASON_FILL)
+        elif tag == TAG_BULLET and len(rec) >= 16:
+            # 글머리표: offset 14의 '이미지 글머리 여부'가 켜진 것만 그림을 참조한다.
+            # 그림 정보의 정확한 위치는 판본마다 흔들려서, 해당 레코드 안의 UINT16을 모두
+            # 참조로 넣는다(그림 글머리표는 드물어 과잉 포함의 부작용이 거의 없다).
+            # 번호 매기기(NUMBERING)는 그림을 참조하지 않으므로 보지 않는다 — 넣으면 레코드가
+            # 길어 우연히 작은 id들이 전부 '사용 중'으로 잡히고 제외가 무력화된다.
+            if struct.unpack_from("<h", rec, 14)[0] != 0:
+                _mark_all_uint16(rec, page_map, REASON_BULLET)
+
+
+def _mark_all_uint16(rec: bytes, page_map: PageMap, reason: str):
+    """레코드 안의 모든 UINT16을 '참조'로 넣습니다(과잉 포함 = 안전한 쪽)."""
+    for off in range(0, len(rec) - 1):
+        page_map.mark_used(struct.unpack_from("<H", rec, off)[0], reason)
 
 
 # ─────────────────────────────────────────
@@ -257,18 +380,35 @@ def _hwpx_manifest(zf: zipfile.ZipFile) -> dict:
     return out
 
 
-def build_page_map_hwpx(hwpx_path: str) -> dict:
-    """HWPX의 그림 → [(인쇄 번호, 물리 쪽), ...]. 키는 BinData 파일명(소문자)과
-    binaryItemIDRef 둘 다. 실패 시 {}."""
+def build_page_map_hwpx(hwpx_path: str) -> PageMap:
+    """HWPX의 그림 → 쪽/사용 여부. 키는 BinData 파일명(소문자)과 binaryItemIDRef 둘 다."""
+    page_map = PageMap()
     try:
         import xml.etree.ElementTree as ET
     except Exception:
-        return {}
+        return page_map
 
-    page_map: dict = {}
     try:
         with zipfile.ZipFile(hwpx_path, "r") as zf:
             id_to_file = _hwpx_manifest(zf)
+            # 쪽을 못 매기는 참조(바탕쪽·머리말·그림 채우기 등)까지 빠짐없이 모은다.
+            # XML 전체에서 binaryItemIDRef를 긁으면 되므로 OLE보다 단순·확실하다.
+            for name in zf.namelist():
+                if not name.lower().endswith((".xml", ".hpf")):
+                    continue
+                try:
+                    text = zf.read(name).decode("utf-8", "replace")
+                except Exception:
+                    continue
+                # 구역 XML 안인데 쪽을 못 매긴 참조는 대개 그림 채우기(<hc:imgBrush>)이고,
+                # 바탕쪽·머리말 파일의 참조는 본문 밖이다. 쪽이 잡히면 이 표시는 무시된다.
+                in_section = bool(re.search(r"section\d+\.xml$", name, re.I))
+                reason = REASON_FILL if in_section else REASON_OUTSIDE
+                for ref in re.findall(r'binaryItemIDRef="([^"]+)"', text):
+                    page_map.mark_used(ref.lower(), reason)
+                    filename = id_to_file.get(ref)
+                    if filename:
+                        page_map.mark_used(filename, reason)
             sections = [n for n in zf.namelist() if re.search(r"section\d+\.xml$", n, re.I)]
             sections.sort(key=lambda n: int(re.search(r"section(\d+)\.xml$", n, re.I).group(1)))
 
@@ -287,8 +427,9 @@ def build_page_map_hwpx(hwpx_path: str) -> dict:
                     if segs:
                         _hwpx_collect_images(para, segs, page_map, id_to_file, numbering)
                 page += 1
+            page_map.ok = True
     except Exception:
-        return page_map
+        page_map.ok = False
     return page_map
 
 
@@ -362,15 +503,44 @@ def _hwpx_collect_images(para, segs: list, page_map: dict, id_to_file: dict,
 # 조회 헬퍼
 # ─────────────────────────────────────────
 
-def lookup_hwp(page_map: dict, stream_name: str):
-    """'BIN0003.png' → [(인쇄 번호, 물리 쪽), ...] (없으면 None)."""
+def _hwp_keys(stream_name: str) -> tuple:
+    """'BIN0003.png' → (bin id,). 이름 형식이 아니면 빈 튜플."""
     m = re.match(r"^BIN([0-9A-Fa-f]{4})\.", stream_name)
-    if not m:
-        return None
-    return page_map.get(int(m.group(1), 16))
+    return (int(m.group(1), 16),) if m else ()
 
 
-def lookup_hwpx(page_map: dict, entry_name: str):
-    """'BinData/image1.BMP' 또는 'image1' → [(인쇄 번호, 물리 쪽), ...] (없으면 None)."""
+def _hwpx_keys(entry_name: str) -> tuple:
+    """'BinData/image1.BMP' → ('image1.bmp', 'image1')."""
     name = entry_name.split("/")[-1].lower()
-    return page_map.get(name) or page_map.get(Path(name).stem)
+    return (name, Path(name).stem)
+
+
+def lookup_hwp(page_map: PageMap, stream_name: str):
+    """'BIN0003.png' → [(인쇄 번호, 물리 쪽), ...] (없으면 None)."""
+    return page_map.lookup(*_hwp_keys(stream_name))
+
+
+def lookup_hwpx(page_map: PageMap, entry_name: str):
+    """'BinData/image1.BMP' 또는 'image1' → [(인쇄 번호, 물리 쪽), ...] (없으면 None)."""
+    return page_map.lookup(*_hwpx_keys(entry_name))
+
+
+def note_hwp(page_map: PageMap, stream_name: str):
+    """쪽은 없지만 쓰이고 있는 그림의 쓰임새('채우기' 등). 아니면 None."""
+    return page_map.note(*_hwp_keys(stream_name))
+
+
+def note_hwpx(page_map: PageMap, entry_name: str):
+    """쪽은 없지만 쓰이고 있는 그림의 쓰임새('본문 밖' 등). 아니면 None."""
+    return page_map.note(*_hwpx_keys(entry_name))
+
+
+def is_unused_hwp(page_map: PageMap, stream_name: str) -> bool:
+    """이 BinData 스트림이 문서 어디에서도 안 쓰이는가(= 변환에서 빼도 되는가)."""
+    keys = _hwp_keys(stream_name)
+    return bool(keys) and page_map.is_unused(*keys)
+
+
+def is_unused_hwpx(page_map: PageMap, entry_name: str) -> bool:
+    """이 BinData 항목이 문서 어디에서도 안 쓰이는가(= 변환에서 빼도 되는가)."""
+    return page_map.is_unused(*_hwpx_keys(entry_name))
