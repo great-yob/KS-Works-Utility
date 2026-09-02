@@ -29,6 +29,8 @@ try:
         PageMap,
         build_page_map_hwp,
         build_page_map_hwpx,
+        is_approx_hwp,
+        is_approx_hwpx,
         is_unused_hwp,
         is_unused_hwpx,
         lookup_hwp,
@@ -58,6 +60,12 @@ except Exception:                                   # pragma: no cover - 방어�
 
     def note_hwpx(page_map, name):
         return None
+
+    def is_approx_hwp(page_map, name):
+        return False
+
+    def is_approx_hwpx(page_map, name):
+        return False
 
     def is_unused_hwp(page_map, name):
         return False
@@ -842,6 +850,7 @@ class HwpProcessor:
             # 성공·실패 어느 쪽이든 로그에 쪽을 붙일 수 있도록 먼저 조회해 둔다.
             pages = lookup_hwp(page_map, name)
             note = note_hwp(page_map, name)
+            approx = is_approx_hwp(page_map, name)
             try:
                 data = self._read_stream(bindata, name)
                 uncomp_data, comp_type = self._decompress(data)
@@ -858,7 +867,7 @@ class HwpProcessor:
                 try:
                     jpg_data = image_bytes_to_jpg(uncomp_data, fmt)
                 except Exception as e:
-                    emit_progress(False, name, fmt, "jpg", f"변환 실패: {e}", pages, note)
+                    emit_progress(False, name, fmt, "jpg", f"변환 실패: {e}", pages, note, approx)
                     skipped += 1
                     continue
 
@@ -877,13 +886,13 @@ class HwpProcessor:
                             _print_json({"event": "size", "name": name,
                                          "message": f"사이즈 조정: 표시 {round(eff)}dpi "
                                                     f"(용량 {before_kb}KB→{len(jpg_data)//1024}KB)",
-                                         **_page_fields(pages, note)})
+                                         **_page_fields(pages, note, approx)})
                         else:
                             size_skipped += 1
                     except Exception as e:
                         size_skipped += 1
                         _print_json({"event": "size", "name": name,
-                                     "message": f"사이즈 조정 실패: {e}", **_page_fields(pages, note)})
+                                     "message": f"사이즈 조정 실패: {e}", **_page_fields(pages, note, approx)})
 
                 # 압축 유지
                 jpg_data_out = self._compress(jpg_data, comp_type)
@@ -899,10 +908,10 @@ class HwpProcessor:
                         stream_renames.append((name, new_name))
 
                 converted += 1
-                emit_progress(True, name, fmt, "jpg", "변환 완료", pages, note)
+                emit_progress(True, name, fmt, "jpg", "변환 완료", pages, note, approx)
 
             except Exception as e:
-                emit_progress(False, name, "unknown", "jpg", f"처리 오류: {e}", pages, note)
+                emit_progress(False, name, "unknown", "jpg", f"처리 오류: {e}", pages, note, approx)
                 skipped += 1
 
         # 모든 스트림 변환 완료 후 DocInfo 일괄 패치
@@ -943,6 +952,7 @@ class HwpProcessor:
             except Exception as e:
                 emit_error(f"최종 파일 저장 실패: {e}")
 
+        emit_approx(page_map)
         emit_unused(unused_names)
         emit_done(converted, skipped)
         if size_adjust:
@@ -1030,6 +1040,7 @@ class HwpxProcessor:
                     continue
                 pages = lookup_hwpx(self.page_map, entry)
                 note = note_hwpx(self.page_map, entry)
+                approx = is_approx_hwpx(self.page_map, entry)
 
                 if not should_convert(fmt, mode):
                     skipped += 1
@@ -1038,7 +1049,7 @@ class HwpxProcessor:
                 try:
                     jpg_data = image_bytes_to_jpg(data, fmt)
                 except Exception as e:
-                    emit_progress(False, original_name, fmt, "jpg", f"변환 실패: {e}", pages, note)
+                    emit_progress(False, original_name, fmt, "jpg", f"변환 실패: {e}", pages, note, approx)
                     skipped += 1
                     continue
 
@@ -1053,8 +1064,9 @@ class HwpxProcessor:
                     self.vector_origins[new_entry] = (fmt, data)
 
                 converted += 1
-                emit_progress(True, original_name, fmt, "jpg", "변환 완료", pages, note)
+                emit_progress(True, original_name, fmt, "jpg", "변환 완료", pages, note, approx)
 
+        emit_approx(self.page_map)
         emit_unused(unused_names)
 
         if not replacements:
@@ -1137,7 +1149,7 @@ def _print_json(data: dict):
     sys.stdout.buffer.flush()
 
 def emit_progress(success: bool, name: str, from_fmt: str, to_fmt: str, message: str,
-                  pages: list = None, note: str = None):
+                  pages: list = None, note: str = None, approx: bool = False):
     """진행 상황 1건. pages는 그림이 놓인 쪽 목록(문서 순서) — 없으면 필드를 생략한다."""
     data = {
         "event": "progress",
@@ -1147,11 +1159,11 @@ def emit_progress(success: bool, name: str, from_fmt: str, to_fmt: str, message:
         "to": to_fmt,
         "message": message,
     }
-    data.update(_page_fields(pages, note))
+    data.update(_page_fields(pages, note, approx))
     _print_json(data)
 
 
-def _page_fields(pages: list, note: str = None) -> dict:
+def _page_fields(pages: list, note: str = None, approx: bool = False) -> dict:
     """쪽 정보를 NDJSON 필드로 만듭니다. pages는 [(인쇄 번호, 물리 쪽), ...].
 
     page          = 문서에 인쇄되는 쪽 번호(사용자가 한글에서 보는 번호)
@@ -1167,7 +1179,16 @@ def _page_fields(pages: list, note: str = None) -> dict:
         out["physicalPage"] = physical
     if len(pages) > 1:
         out["pages"] = [d for d, _ in pages]
+    if approx:
+        out["pageApprox"] = True     # 여러 쪽에 걸친 표 뒤라 실제보다 작게 나올 수 있다
     return out
+
+def emit_approx(page_map):
+    """쪽 번호가 근사치가 되는 지점을 한 번 알립니다(여러 쪽에 걸친 표가 있는 문서)."""
+    start = getattr(page_map, "approx_from", None)
+    if start:
+        _print_json({"event": "approx", "fromPage": start})
+
 
 def emit_unused(names: list):
     """문서가 참조하지 않아 변환에서 제외한 그림 목록(있을 때만)."""

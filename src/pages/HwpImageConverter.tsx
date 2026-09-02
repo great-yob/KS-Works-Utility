@@ -33,6 +33,7 @@ type LogEntry = {
   physicalPage?: number;  // 문서의 몇 번째 쪽 ('새 번호로 시작' 때문에 다를 때만)
   pages?: number[];       // 같은 그림이 여러 곳에 쓰인 경우
   pageNote?: string;      // 쪽을 못 매기는 쓰임새('채우기' 등)
+  pageApprox?: boolean;   // 여러 쪽에 걸친 표 뒤라 쪽 번호가 근사치
 };
 
 const log = (
@@ -132,20 +133,26 @@ const LOG_STYLES: Record<LogTone, { row: string; tag: string; chip: string }> = 
 const CHIP_BASE =
   "shrink-0 inline-block px-1.5 rounded-full ring-1 text-[10px] leading-[15px] tabular-nums text-white";
 
+/** 칩에 한 번에 늘어놓을 쪽 수. 배경 그림처럼 수십 곳에 쓰이면 줄이 너무 길어집니다. */
+const MAX_LISTED_PAGES = 6;
+
 /**
  * 그림이 원본 한글 문서에서 놓인 쪽 칩("3p").
  * 값은 **문서에 인쇄되는 쪽 번호**입니다('새 번호로 시작' 반영). 같은 그림이 여러 곳에
- * 쓰이면 쪽을 모두 나열합니다("3, 13, 45p").
+ * 쓰이면 쪽을 나열하고("3, 13, 45p"), 여러 쪽에 걸친 표 뒤라 값을 장담할 수 없으면
+ * 물결표를 붙입니다("109p~").
  */
 function PageChip({
   page,
   pages,
   pageNote,
+  pageApprox,
   tone,
 }: {
   page?: number;
   pages?: number[];
   pageNote?: string;
+  pageApprox?: boolean;
   tone: LogTone;
 }) {
   if (typeof page !== "number") {
@@ -154,8 +161,15 @@ function PageChip({
     if (!pageNote) return null;
     return <span className={`${CHIP_BASE} bg-sky-400/15 ring-sky-400/25`}>{pageNote}</span>;
   }
-  const list = pages && pages.length > 1 ? pages.join(", ") : String(page);
-  return <span className={`${CHIP_BASE} ${LOG_STYLES[tone].chip}`}>{list}p</span>;
+  const all = pages && pages.length > 1 ? pages : [page];
+  const shown = all.slice(0, MAX_LISTED_PAGES).join(", ");
+  const rest = all.length > MAX_LISTED_PAGES ? ` 외 ${all.length - MAX_LISTED_PAGES}곳` : "";
+  return (
+    <span className={`${CHIP_BASE} ${LOG_STYLES[tone].chip}`}>
+      {shown}p{pageApprox ? "~" : ""}
+      {rest}
+    </span>
+  );
 }
 
 /* ─────────────── 컴포넌트 ─────────────── */
@@ -373,6 +387,7 @@ export default function HwpImageConverter() {
                 physicalPage: data.physicalPage as number | undefined,
                 pages: data.pages as number[] | undefined,
                 pageNote: data.pageNote as string | undefined,
+                pageApprox: data.pageApprox === true,
               };
               if (data.success) {
                 converted++;
@@ -408,7 +423,17 @@ export default function HwpImageConverter() {
                   physicalPage: data.physicalPage as number | undefined,
                   pages: data.pages as number[] | undefined,
                   pageNote: data.pageNote as string | undefined,
+                  pageApprox: data.pageApprox === true,
                 }),
+              ];
+              setState((prev) => ({ ...prev, logs }));
+            } else if (data.event === "approx") {
+              logs = [
+                ...logs,
+                log(
+                  "안내",
+                  `여러 쪽에 걸친 표가 있어 ${data.fromPage}번째 쪽 이후의 쪽 번호는 근사치입니다 (~ 표시). 표시된 쪽부터 뒤로 찾아보세요.`
+                ),
               ];
               setState((prev) => ({ ...prev, logs }));
             } else if (data.event === "unused") {
@@ -735,6 +760,7 @@ export default function HwpImageConverter() {
                       page={l.page}
                       pages={l.pages}
                       pageNote={l.pageNote}
+                      pageApprox={l.pageApprox}
                       tone={l.tone}
                     />
                   )}

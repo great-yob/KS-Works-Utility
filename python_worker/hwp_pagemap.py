@@ -62,6 +62,7 @@ FILL_GRADIENT = 4
 TAG_PARA_SHAPE = 25
 
 # BodyText 레코드 태그
+TAG_PAGE_DEF = 73           # 용지·여백 — 본문 영역 높이를 얻는다
 TAG_PARA_HEADER = 66
 TAG_LIST_HEADER = 72        # 표 셀 등 — 셀 배경(테두리/채우기 ID)을 들고 있다
 TAG_PARA_TEXT = 67
@@ -70,6 +71,10 @@ TAG_CTRL_HEADER = 71
 TAG_SHAPE_PICTURE = 85
 
 LINE_SEG_SIZE = 36          # 줄 정보 1개 크기(바이트)
+# 같은 쪽이라면 다음 줄은 앞 줄 '아래'에서 시작한다. 앞 줄 영역을 이 비율 이상 파고들면
+# 새 쪽의 첫 줄로 본다. 'vert가 작아지면 새 쪽'만 보면, 쪽을 꽉 채우는 표가 연달아 나오는
+# 문서(회의자료·의안처럼 본문이 통째로 표인 경우)는 vert가 계속 0이라 쪽이 안 넘어간다.
+LINE_OVERLAP_RATIO = 0.5
 PARA_BREAK_PAGE = 0x04      # 문단머리 '나누기 종류' 중 쪽 나누기 비트
 MAX_PAGES_PER_IMAGE = 20    # 같은 그림이 여러 곳에 쓰인 경우 보관할 쪽 수 상한
 
@@ -100,6 +105,19 @@ def _iter_records(data: bytes):
             break
         yield tag, level, data[pos + hdr: pos + hdr + size]
         pos += hdr + size
+
+
+def _starts_new_page(vert, height, colstart, prev) -> bool:
+    """이 줄이 새 쪽의 첫 줄인가. prev는 (vert, height, colstart) 또는 None.
+
+    한 줄이 가로로 쪼개진 '세그먼트'(그림 옆으로 글이 흐를 때)는 세로 위치·높이가 같고
+    가로 시작 위치만 오른쪽으로 가므로 새 쪽이 아니다."""
+    if prev is None:
+        return False
+    prev_vert, prev_height, prev_colstart = prev
+    if vert == prev_vert and height == prev_height and colstart > prev_colstart:
+        return False                     # 같은 줄의 다음 세그먼트
+    return vert < prev_vert + prev_height * LINE_OVERLAP_RATIO
 
 
 def _page_of_pos(segs: list, char_pos: int) -> int:
@@ -141,6 +159,7 @@ class PageMap:
         self.used: set = set()
         self.notes: dict = {}       # 키 → 쪽을 못 매기는 쓰임새('채우기' 등)
         self.ok: bool = False
+        self.approx_from = None     # 이 물리 쪽부터는 쪽 번호가 근사치(아래 설명 참고)
 
     def lookup(self, *keys):
         for key in keys:
@@ -157,6 +176,17 @@ class PageMap:
             if key in self.notes:
                 return self.notes[key]
         return None
+
+    def is_approx(self, entries) -> bool:
+        """이 위치가 '여러 쪽에 걸친 표' 뒤라서 쪽 번호를 믿을 수 없는가.
+
+        한글은 표가 어느 행에서 쪽을 넘었는지 저장하지 않는다. 그래서 쪽 아래로 넘치는
+        줄(=표가 나뉘거나 다음 쪽으로 밀린 자리)이 한 번이라도 나오면, 그 뒤의 쪽 번호는
+        실제보다 작게 나올 수 있다. 그 경계를 approx_from에 기록해 두고 여기서 알린다."""
+        if self.approx_from is None or not entries:
+            return False
+        # 여러 곳에 쓰인 그림은 한 군데라도 경계 뒤면 목록 전체를 근사치로 본다.
+        return max(physical for _display, physical in entries) >= self.approx_from
 
     def mark_used(self, key, reason: str):
         self.used.add(key)
@@ -255,7 +285,8 @@ def build_page_map_hwp(hwp_path: str) -> PageMap:
                 except Exception:
                     data = raw
 
-            prev_vert = None        # 직전 줄의 세로 위치(쪽 넘김 판단용)
+            prev_line = None        # 직전 줄의 (세로 위치, 높이, 가로 시작) — 쪽 넘김 판단용
+            text_height = None      # 본문 영역 높이(쪽 아래로 넘치는 줄을 알아내는 데 쓴다)
             ctrl_positions: list = []
             segs: list = []         # [(textpos, page)] — 현재 최상위 문단의 줄들
             ctrl_index = 0
@@ -265,7 +296,13 @@ def build_page_map_hwp(hwp_path: str) -> PageMap:
             current_page = page     # 가장 최근 개체(CTRL_HEADER)가 놓인 쪽
 
             for tag, level, rec in _iter_records(data):
-                if tag == TAG_PARA_HEADER and level == 0:
+                if tag == TAG_PAGE_DEF and text_height is None and len(rec) >= 40:
+                    # 용지 가로(0) 세로(4) 여백 왼(8) 오(12) 위(16) 아래(20) 머리말(24) 꼬리말(28)
+                    paper_h = struct.unpack_from("<I", rec, 4)[0]
+                    m_top, m_bottom, m_header, m_footer = struct.unpack_from("<4I", rec, 16)
+                    text_height = paper_h - m_top - m_bottom - m_header - m_footer
+
+                elif tag == TAG_PARA_HEADER and level == 0:
                     ctrl_positions, segs, ctrl_index = [], [], 0
                     pending_break = bool((rec[11] if len(rec) > 11 else 0) & PARA_BREAK_PAGE)
                     first_seg = True
@@ -279,14 +316,21 @@ def build_page_map_hwp(hwp_path: str) -> PageMap:
                     # 최상위 문단의 줄만 쪽 넘김을 만든다(표 안 문단은 셀 기준 좌표라 제외).
                     segs = []
                     for i in range(len(rec) // LINE_SEG_SIZE):
-                        textpos, vert = struct.unpack_from("<Ii", rec, i * LINE_SEG_SIZE)
-                        if prev_vert is not None and vert < prev_vert:
+                        base = i * LINE_SEG_SIZE
+                        textpos, vert, height = struct.unpack_from("<Iii", rec, base)
+                        colstart = struct.unpack_from("<i", rec, base + 24)[0]
+                        if _starts_new_page(vert, height, colstart, prev_line):
                             page += 1
-                        elif first_seg and pending_break and prev_vert is not None:
+                        elif first_seg and pending_break and prev_line is not None:
                             page += 1
-                        prev_vert = vert
+                        prev_line = (vert, height, colstart)
                         first_seg = False
                         segs.append((textpos, page))
+                        # 쪽 아래로 넘치는 줄 = 한글이 표를 나눴거나 다음 쪽으로 민 자리.
+                        # 그 안쪽 쪽 넘김은 파일에 없으므로 여기서부터는 근사치다.
+                        if (page_map.approx_from is None and text_height
+                                and vert + height > text_height):
+                            page_map.approx_from = page
                     if para_shape is not None and segs:
                         _note_page(shape_pages, para_shape, segs[0][1], numbering)
                         para_shape = None
@@ -489,11 +533,13 @@ def build_page_map_hwpx(hwpx_path: str) -> PageMap:
                     root = ET.fromstring(zf.read(section).decode("utf-8", "replace"))
                 except Exception:
                     continue
-                prev_vert = None
+                prev_line = None
+                text_height = _hwpx_text_height(zf, section)
                 for para in root:
                     if _local(para) != "p":
                         continue
-                    segs, page, prev_vert = _hwpx_para_lines(para, page, prev_vert)
+                    segs, page, prev_line = _hwpx_para_lines(
+                        para, page, prev_line, text_height, page_map)
                     if segs:
                         _hwpx_collect_images(para, segs, page_map, id_to_file, numbering)
                 page += 1
@@ -503,8 +549,26 @@ def build_page_map_hwpx(hwpx_path: str) -> PageMap:
     return page_map
 
 
-def _hwpx_para_lines(para, page: int, prev_vert):
-    """최상위 문단의 줄 목록 [(textpos, page)]과 갱신된 (page, prev_vert)."""
+def _hwpx_text_height(zf, section_name: str):
+    """구역 XML의 용지 설정에서 본문 영역 높이를 구합니다(없으면 None)."""
+    try:
+        text = zf.read(section_name).decode("utf-8", "replace")
+    except Exception:
+        return None
+    page_m = re.search(r'<hp:pagePr[^>]*height="(\d+)"', text)
+    margin_m = re.search(r"<hp:margin[^>]*/>", text)
+    if not (page_m and margin_m):
+        return None
+    attrs = dict(re.findall(r'(\w+)="(-?\d+)"', margin_m.group(0)))
+    try:
+        return (int(page_m.group(1)) - int(attrs.get("top", 0)) - int(attrs.get("bottom", 0))
+                - int(attrs.get("header", 0)) - int(attrs.get("footer", 0)))
+    except ValueError:
+        return None
+
+
+def _hwpx_para_lines(para, page: int, prev_line, text_height=None, page_map=None):
+    """최상위 문단의 줄 목록 [(textpos, page)]과 갱신된 (page, prev_line)."""
     segs = []
     page_break = para.get("pageBreak") == "1"
     first_seg = True
@@ -517,16 +581,21 @@ def _hwpx_para_lines(para, page: int, prev_vert):
             try:
                 vert = int(seg.get("vertpos", "0"))
                 textpos = int(seg.get("textpos", "0"))
+                height = int(seg.get("vertsize", "0"))
+                colstart = int(seg.get("horzpos", "0"))
             except ValueError:
                 continue
-            if prev_vert is not None and vert < prev_vert:
+            if _starts_new_page(vert, height, colstart, prev_line):
                 page += 1
-            elif first_seg and page_break and prev_vert is not None:
+            elif first_seg and page_break and prev_line is not None:
                 page += 1
-            prev_vert = vert
+            prev_line = (vert, height, colstart)
             first_seg = False
             segs.append((textpos, page))
-    return segs, page, prev_vert
+            if (page_map is not None and page_map.approx_from is None
+                    and text_height and vert + height > text_height):
+                page_map.approx_from = page       # 여기서부터 쪽 번호는 근사치
+    return segs, page, prev_line
 
 
 def _hwpx_collect_images(para, segs: list, page_map: dict, id_to_file: dict,
@@ -603,6 +672,16 @@ def note_hwp(page_map: PageMap, stream_name: str):
 def note_hwpx(page_map: PageMap, entry_name: str):
     """쪽은 없지만 쓰이고 있는 그림의 쓰임새('본문 밖' 등). 아니면 None."""
     return page_map.note(*_hwpx_keys(entry_name))
+
+
+def is_approx_hwp(page_map: PageMap, stream_name: str) -> bool:
+    """이 그림의 쪽 번호가 근사치인가(여러 쪽에 걸친 표 뒤쪽)."""
+    return page_map.is_approx(page_map.lookup(*_hwp_keys(stream_name)))
+
+
+def is_approx_hwpx(page_map: PageMap, entry_name: str) -> bool:
+    """이 그림의 쪽 번호가 근사치인가(여러 쪽에 걸친 표 뒤쪽)."""
+    return page_map.is_approx(page_map.lookup(*_hwpx_keys(entry_name)))
 
 
 def is_unused_hwp(page_map: PageMap, stream_name: str) -> bool:
