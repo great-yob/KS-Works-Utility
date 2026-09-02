@@ -77,6 +77,23 @@ except Exception:                                   # pragma: no cover - 방어�
     def is_unused_hwpx(page_map, name):
         return False
 
+def sort_by_page(names: list, pages_of) -> list:
+    """그림을 쪽 번호 순으로 정렬합니다(로그가 문서를 읽는 순서대로 나오도록).
+
+    BinData 스트림 순서는 한글이 그림을 저장한 순서(작업자가 넣은 순서)라서 최종 쪽 순서와
+    무관합니다. 변환 자체는 순서를 타지 않으므로(그림끼리 독립적이고 DocInfo 패치는 루프가
+    끝난 뒤 일괄 처리) 보기 좋은 순서로 돌려도 결과는 같습니다.
+    쪽을 모르는 그림(채우기 등 위치를 못 매긴 것)은 뒤로 보내고, 같은 쪽끼리는 원래 순서를
+    유지합니다."""
+    keyed = []
+    for index, name in enumerate(names):
+        pages = pages_of(name)
+        page = pages[0][0] if pages else None
+        keyed.append(((page is None, page or 0, index), name))
+    keyed.sort(key=lambda item: item[0])
+    return [name for _key, name in keyed]
+
+
 def refine_pages_with_hangul(page_map, path: str):
     """한글이 설치돼 있으면 쪽 번호를 한글에게 직접 물어 정확한 값으로 바꿉니다.
 
@@ -856,6 +873,7 @@ class HwpProcessor:
             return
 
         stream_names = self._enum_bindata_streams(bindata)
+        stream_names = sort_by_page(stream_names, lambda n: lookup_hwp(page_map, n))
         converted = 0
         skipped = 0
         unused_names = []          # 문서가 참조하지 않아 변환에서 제외한 그림
@@ -1050,7 +1068,8 @@ class HwpxProcessor:
         refine_pages_with_hangul(self.page_map, hwpx_path)
 
         with zipfile.ZipFile(output_path, "r") as zf:
-            entries = self._find_bindata_entries(zf)
+            entries = sort_by_page(self._find_bindata_entries(zf),
+                                   lambda e: lookup_hwpx(self.page_map, e))
 
             for entry in entries:
                 data = zf.read(entry)
