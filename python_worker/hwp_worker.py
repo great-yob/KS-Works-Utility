@@ -77,6 +77,54 @@ except Exception:                                   # pragma: no cover - 방어�
     def is_unused_hwpx(page_map, name):
         return False
 
+# 회전된 그림을 바로 세우는 모듈(Acrobat으로 PDF를 만들 때 회전 그림이 찢어지는 문제).
+# 번들이 빠져도 변환은 계속돼야 하므로 실패를 흡수하고, 그때는 회전을 그대로 둔다.
+try:
+    import hwp_rotation
+except Exception:                                   # pragma: no cover - 방어적 폴백
+    hwp_rotation = None
+
+
+def plan_rotation_hwp(path: str):
+    """바로 세울 회전 그림 계획(hwp_rotation.RotationPlan). 모듈이 없거나 실패하면 None."""
+    if hwp_rotation is None:
+        return None
+    try:
+        return hwp_rotation.plan_hwp(path)
+    except Exception:
+        return None
+
+
+def plan_rotation_hwpx(path: str):
+    """plan_rotation_hwp의 HWPX판."""
+    if hwp_rotation is None:
+        return None
+    try:
+        return hwp_rotation.plan_hwpx(path)
+    except Exception:
+        return None
+
+
+def rotate_for_plan(rot_plan, key, name: str, jpg_data: bytes):
+    """회전 계획에 든 그림의 픽셀을 미리 돌린다 → (제자리용 jpg | None, {각도: 사본 jpg}).
+
+    문서에 기록하는 건 변환 루프가 끝난 뒤 일괄로 한다. 여기서 실패하면 (None, {})를 돌려
+    그 그림만 회전을 그대로 둔다."""
+    try:
+        angle = rot_plan.in_place.get(key)
+        here = hwp_rotation.rotate_jpg(jpg_data, angle) if angle is not None else None
+        copies = {a: hwp_rotation.rotate_jpg(jpg_data, a) for a in rot_plan.copies.get(key, [])}
+        return here, copies
+    except Exception as e:
+        emit_error(f"{name} 회전 준비 실패 — 이 그림은 회전을 그대로 둡니다: {e}")
+        return None, {}
+
+
+def _bin_id_of(stream_name: str):
+    m = re.match(r'^BIN([0-9A-Fa-f]{4})\.', stream_name)
+    return int(m.group(1), 16) if m else None
+
+
 def sort_by_page(names: list, pages_of) -> list:
     """그림을 쪽 번호 순으로 정렬합니다(로그가 문서를 읽는 순서대로 나오도록).
 
@@ -348,7 +396,23 @@ def _resize_jpg_bytes(data: bytes, f: float, target_dpi: int = 300) -> bytes:
     return out.getvalue()
 
 
-def size_adjust_hwpx(path: str, vector_origins: dict = None, page_map: PageMap = None) -> None:
+def _hwpx_clip_is_full(clip: tuple, frame_w: int, frame_h: int, tol: float = 0.03) -> bool:
+    """imgClip(속성 순서 left, right, top, bottom의 값)이 '자르기 없음'인가.
+
+    판본에 따라 이름대로(left=0 right=W top=0 bottom=H) 또는 값 순서대로(left=0 right=0
+    top=W bottom=H, 한글 2010) 쓰이는데, 자르기 없음은 두 표기가 겹치지 않아 둘 다 본다."""
+    left, right, top, bottom = clip
+
+    def near(value, full):
+        return abs(value - full) <= full * tol
+
+    labelled = left == 0 and top == 0 and near(right, frame_w) and near(bottom, frame_h)
+    positional = left == 0 and right == 0 and near(top, frame_w) and near(bottom, frame_h)
+    return labelled or positional
+
+
+def size_adjust_hwpx(path: str, vector_origins: dict = None, page_map: PageMap = None,
+                     vector_rotations: dict = None) -> None:
     """변환 완료된 HWPX에 '사이즈 조정'을 적용한다(변환과 분리된 후처리).
 
     한글이 그림에 표시하는 '확대/축소 비율'(실측으로 확정한 식):
@@ -368,6 +432,7 @@ def size_adjust_hwpx(path: str, vector_origins: dict = None, page_map: PageMap =
     되는 걸 막는다. HWPX는 자르기가 비율(imgClip/imgDim=1.0)이라 픽셀이 바뀌어도 XML 수정이
     불필요하다(OLE의 off44와 달리). EMF는 좌표 검증이 어려워 건너뛴다(원본 렌더 유지)."""
     vector_origins = vector_origins or {}
+    vector_rotations = vector_rotations or {}
     page_map = page_map or PageMap()
     PIC_RE = re.compile(r'<hp:pic\b.*?</hp:pic>', re.S)
     SECTION_RE = re.compile(r'section\d+\.xml$', re.I)
@@ -387,6 +452,10 @@ def size_adjust_hwpx(path: str, vector_origins: dict = None, page_map: PageMap =
     # 각 그림 블록에서 curSz와 잘린비율(clip/dim) 수집 + ref 등장 횟수
     ref_count: dict = {}
     ref_info: dict = {}   # ref -> (curW, curH, clipFracW, clipFracH)
+    # imgDim이 없는 판본(한글 2010~2020 초기)의 자르기 값. 이때 한글은 자르기 기준을 그림
+    # 픽셀×75로 다시 잡으므로, 픽셀을 줄이면 자르기 좌표가 엉뚱한 곳을 가리킨다(실측: 자른
+    # 그림이 왼쪽 위로 밀려 테두리가 잘려 보임). 그래서 자르기 없음이 확실할 때만 조정한다.
+    ref_clip_nodim: dict = {}
     for fn, raw in contents.items():
         if not SECTION_RE.search(fn):
             continue
@@ -409,6 +478,8 @@ def size_adjust_hwpx(path: str, vector_origins: dict = None, page_map: PageMap =
                     cfw = (cr - cl) / dw
                 if dh > 0:
                     cfh = (cb - ct) / dh
+            elif clip_m:
+                ref_clip_nodim[ref] = tuple(map(int, clip_m.groups()))
             ref_info[ref] = (cw, ch, cfw, cfh)
 
     # 화면 표시 해상도(보이는 픽셀 ÷ 표시 inch)가 이 값을 넘는 그림만 이 값으로 낮춘다.
@@ -440,6 +511,9 @@ def size_adjust_hwpx(path: str, vector_origins: dict = None, page_map: PageMap =
         if min(cw, ch, pw, ph, cfw, cfh) <= 0:
             skipped += 1
             continue
+        if ref in ref_clip_nodim and not _hwpx_clip_is_full(ref_clip_nodim[ref], pw * 75, ph * 75):
+            skipped += 1                  # imgDim 없는 자른 그림 → 픽셀을 줄이면 자르기가 어긋난다
+            continue
         # 표시 해상도(dpi) = 보이는(=잘린 후) 픽셀 / 표시 크기(inch). 축마다 계산.
         eff_w = cfw * pw * 7200.0 / cw
         eff_h = cfh * ph * 7200.0 / ch
@@ -455,11 +529,17 @@ def size_adjust_hwpx(path: str, vector_origins: dict = None, page_map: PageMap =
                 if vfmt != "wmf":            # EMF 등: 좌표 검증 어려움 → 원본 렌더 유지(안전)
                     skipped += 1
                     continue
-                out = _rerender_vector_jpg(vbytes, vfmt, cw, ch)   # 벡터를 작게 '재렌더'(또렷)
+                # 회전을 바로 세운 그림은 원본 벡터(돌리기 전) 기준 크기로 그린 뒤 같은 각도로 돌린다.
+                angle = vector_rotations.get(key, 0)
+                rw, rh = (ch, cw) if angle in (90, 270) else (cw, ch)
+                out = _rerender_vector_jpg(vbytes, vfmt, rw, rh)   # 벡터를 작게 '재렌더'(또렷)
                 if out is None:              # 안전 렌더 불가 → 고해상 유지
                     skipped += 1
                     continue
                 new_jpg, nw, nh, _ = out
+                if angle:
+                    new_jpg = hwp_rotation.rotate_jpg(new_jpg, angle)
+                    nw, nh = (nh, nw) if angle in (90, 270) else (nw, nh)
                 contents[key] = new_jpg      # 자르기 비율(imgClip/imgDim)은 그대로 1.0 → XML 미수정
                 msg = (f"사이즈 조정(재렌더): 표시 {round(eff)}dpi→ {nw}x{nh}px "
                        f"(용량 {before // 1024}KB→{len(new_jpg) // 1024}KB)")
@@ -653,6 +733,7 @@ class HwpProcessor:
     STGM_DIRECT = 0x00000000
     STGM_READ = 0x00000000
     STGM_SHARE_DENY_WRITE = 0x00000020
+    STGM_CREATE = 0x00001000
 
     def _open_storage(self, hwp_path: str, read_only: bool = False):
         """OLE 스토리지를 엽니다. 경로 버그를 우회하기 위해 임시 파일로 복사하여 처리할 수 있습니다."""
@@ -801,6 +882,9 @@ class HwpProcessor:
         """HWP 파일 내 이미지 목록을 반환합니다. used=False면 변환에서 제외될 그림입니다."""
         images = []
         page_map = build_page_map_hwp(hwp_path)
+        # 제자리에서 바로 세울 회전 그림은 '선택 정리'에서도 변환되므로 대상 수에 넣게 표시한다.
+        rot_plan = plan_rotation_hwp(hwp_path)
+        rotated_bins = set(rot_plan.in_place) if rot_plan else set()
         self._current_tmp_path = None
         try:
             storage = self._open_storage(hwp_path, read_only=True)
@@ -826,6 +910,7 @@ class HwpProcessor:
                         "format": fmt,
                         "size": len(uncomp_data),
                         "used": not is_unused_hwp(page_map, name),
+                        "rotated": _bin_id_of(name) in rotated_bins,
                     })
                 except Exception:
                     pass
@@ -867,6 +952,13 @@ class HwpProcessor:
         page_map = build_page_map_hwp(hwp_path)
         refine_pages_with_hangul(page_map, hwp_path)
 
+        # 회전된 그림을 바로 세울 계획도 BodyText를 읽기만 하므로 COM 세션 전에 세운다.
+        # 픽셀은 아래 루프에서 돌려 두고(rotated/rot_copies), 문서 쪽 수정은 루프가 끝난 뒤
+        # DocInfo·BodyText를 한꺼번에 고칠 수 있을 때만 함께 기록한다.
+        rot_plan = plan_rotation_hwp(hwp_path)
+        rotated = {}               # bin id → (스트림 이름, 돌린 jpg, 압축 방식) — 제자리
+        rot_copies = {}            # (bin id, 각도) → (돌린 jpg, 압축 방식) — 새 BinData 사본
+
         # 임시 파일 경로를 초기화
         self._current_tmp_path = None
         storage = self._open_storage(hwp_path, read_only=False)
@@ -888,6 +980,13 @@ class HwpProcessor:
         conversions = {}
         stream_renames = []
 
+        def stage_rotation(bin_id, name, jpg_data, comp_type):
+            here, copies = rotate_for_plan(rot_plan, bin_id, name, jpg_data)
+            if here is not None:
+                rotated[bin_id] = (name, here, comp_type)
+            for angle, jpg in copies.items():
+                rot_copies[(bin_id, angle)] = (jpg, comp_type)
+
         for name in stream_names:
             # 문서 어디에서도 안 쓰이는 그림(편집 중 지운 그림의 잔여 BinData)은 건드리지
             # 않는다. 판정은 본문 그림 + 그림 채우기 + 그림 글머리표를 모두 본 뒤에만 참이며,
@@ -906,7 +1005,15 @@ class HwpProcessor:
                 if fmt == "unknown":
                     fmt = name.split(".")[-1].lower()
 
-                if not should_convert(fmt, mode):
+                m = re.match(r'^BIN([0-9A-Fa-f]{4})\.', name)
+                bin_id = int(m.group(1), 16) if m else None
+
+                # 회전 그림은 제자리(in_place)로 세울 거면 '선택 정리'에서 빠지는 형식이어도
+                # 변환한다. 사본(copies)만 필요하면 원본은 규칙대로 두고 사본만 만든다.
+                rotate_here = bool(rot_plan) and bin_id in rot_plan.in_place
+                needs_copy = bool(rot_plan) and bin_id in rot_plan.copies
+                convert_this = should_convert(fmt, mode) or rotate_here
+                if not convert_this and not needs_copy:
                     skipped += 1
                     continue
 
@@ -919,8 +1026,10 @@ class HwpProcessor:
                     skipped += 1
                     continue
 
-                m = re.match(r'^BIN([0-9A-Fa-f]{4})\.', name)
-                bin_id = int(m.group(1), 16) if m else None
+                if not convert_this:
+                    skipped += 1
+                    stage_rotation(bin_id, name, jpg_data, comp_type)
+                    continue
 
                 # 사이즈 조정(변환이 끝난 JPG에만 후처리로 적용 — HWPX와 동일 규칙)
                 if size_adjust and bin_id is not None and bin_id in pic_info:
@@ -957,22 +1066,47 @@ class HwpProcessor:
 
                 converted += 1
                 emit_progress(True, name, fmt, "jpg", "변환 완료", pages, note, approx)
+                if rotate_here or needs_copy:
+                    stage_rotation(bin_id, name, jpg_data, comp_type)
 
             except Exception as e:
                 emit_progress(False, name, "unknown", "jpg", f"처리 오류: {e}", pages, note, approx)
                 skipped += 1
 
-        # 모든 스트림 변환 완료 후 DocInfo 일괄 패치
-        if conversions:
+        # 모든 스트림 변환 완료 후 DocInfo 일괄 패치(확장자 + 회전 그림 사본)
+        rot_sections = {}
+        if rot_plan:
+            rot_plan.keep(set(rotated), set(rot_copies))
+        if conversions or rot_plan:
             try:
                 docinfo_data = self._read_stream(storage, "DocInfo")
                 docinfo_uncomp, comp_type = self._decompress(docinfo_data)
-                
+
                 docinfo_patched = self._patch_docinfo(docinfo_uncomp, conversions)
-                
+
+                # 회전 그림: 사본 BinData 추가와 BodyText 수정을 메모리에서 먼저 끝내 본다.
+                # 하나라도 실패하면 아무것도 기록하지 않는다 — 픽셀만 돌고 회전각이 남으면
+                # 그림이 두 번 돌아간 채로 보이기 때문이다.
+                if rot_plan:
+                    try:
+                        with_copies = hwp_rotation.add_bin_copies(docinfo_patched, rot_plan)
+                        rot_sections = self._patch_rotated_sections(storage, rot_plan)
+                        docinfo_patched = with_copies
+                    except Exception as e:
+                        rot_sections = {}
+                        emit_error(f"회전 그림 바로 세우기 실패 — 회전은 원래대로 둡니다: {e}")
+
                 docinfo_comp = self._compress(docinfo_patched, comp_type)
                 self._write_stream(storage, "DocInfo", docinfo_comp)
-                
+
+                if rot_sections:
+                    try:
+                        self._write_rotation(storage, bindata, rot_plan, rot_sections,
+                                             rotated, rot_copies)
+                    except Exception as e:
+                        rot_sections = {}
+                        emit_error(f"회전 그림 기록 실패: {e}")
+
                 # 스트림 이름 일괄 변경
                 for old_name, new_name in stream_renames:
                     try:
@@ -989,22 +1123,95 @@ class HwpProcessor:
         except Exception as e:
             emit_error(f"OLE 커밋 실패: {e}")
 
-        # 리소스 정리 후, 임시 파일을 최종 output_path로 복사
+        # 압축 정리된 사본을 만든 뒤 리소스 정리, 최종 output_path로 복사
         del bindata
+        compact_path = self._compact(storage)
         del storage
         if hasattr(self, '_current_tmp_path') and self._current_tmp_path:
             try:
-                shutil.copy2(self._current_tmp_path, output_path)
+                shutil.copy2(compact_path or self._current_tmp_path, output_path)
                 os.remove(self._current_tmp_path)
                 self._current_tmp_path = None
             except Exception as e:
                 emit_error(f"최종 파일 저장 실패: {e}")
+        if compact_path:
+            try:
+                os.remove(compact_path)
+            except OSError:
+                pass
 
         emit_approx(page_map)
         emit_unused(unused_names)
+        if rot_plan is not None:
+            stream_of = {_bin_id_of(n): n for n in stream_names}
+            emit_rotation(rot_plan, bool(rot_sections), stream_of,
+                          lambda n: _page_fields(lookup_hwp(page_map, n),
+                                                 note_hwp(page_map, n),
+                                                 is_approx_hwp(page_map, n)))
         emit_done(converted, skipped)
         if size_adjust:
             _print_json({"event": "sizeDone", "adjusted": size_adjusted, "skipped": size_skipped})
+
+    def _compact(self, storage):
+        """커밋된 문서를 새 복합 파일에 통째로 복사해 빈 공간을 뺀 사본 경로를 돌려줍니다.
+
+        OLE 복합 파일은 스트림을 줄이거나 바꿔 써도 원래 쓰던 섹터를 파일에서 돌려주지 않는다.
+        그래서 BMP→JPG 변환·사이즈 조정으로 그림이 작아져도 파일 크기는 그대로였다(실측:
+        실제 데이터 82MB인 문서가 205MB). 새 파일에 CopyTo하면 쓰이는 섹터만 옮겨져 한글에서
+        다시 저장한 것과 같은 크기가 된다(실측 205.5MB→82.8MB, 0.2초, 스트림 190개 바이트 일치).
+        실패하면 None — 호출자는 정리 전 파일을 그대로 쓴다."""
+        import pythoncom
+        fd, path = tempfile.mkstemp(suffix=".hwp")
+        os.close(fd)
+        try:
+            dest = pythoncom.StgCreateDocfile(
+                path, self.STGM_CREATE | self.STGM_READWRITE | self.STGM_SHARE_EXCLUSIVE, 0)
+            storage.CopyTo(None, None, dest)
+            dest.SetClass(storage.Stat(0)[8])
+            dest.Commit(0)
+            del dest
+            return path
+        except Exception:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            return None
+
+    def _patch_rotated_sections(self, storage, rot_plan) -> dict:
+        """바로 세울 그림이 있는 구역을 메모리에서 고쳐 {구역 이름: 압축된 바이트}로 돌려줍니다."""
+        out = {}
+        body = storage.OpenStorage("BodyText", None,
+                                   self.STGM_READ | self.STGM_SHARE_EXCLUSIVE, None, 0)
+        try:
+            for section, targets in rot_plan.targets().items():
+                data, comp_type = self._decompress(self._read_stream(body, section))
+                out[section] = self._compress(hwp_rotation.patch_section(data, targets), comp_type)
+        finally:
+            del body
+        return out
+
+    def _write_rotation(self, storage, bindata, rot_plan, sections: dict,
+                        rotated: dict, rot_copies: dict):
+        """돌린 픽셀(제자리·사본)과 고친 구역을 기록합니다. DocInfo는 호출 전에 이미 기록됨."""
+        for (bin_id, angle), new_id in rot_plan.new_ids.items():
+            jpg_data, comp_type = rot_copies[(bin_id, angle)]
+            stream = bindata.CreateStream(
+                f"BIN{new_id:04X}.jpg",
+                self.STGM_READWRITE | self.STGM_SHARE_EXCLUSIVE | self.STGM_CREATE, 0, 0)
+            stream.Write(self._compress(jpg_data, comp_type))
+            del stream
+        for bin_id in rot_plan.in_place:
+            name, jpg_data, comp_type = rotated[bin_id]
+            self._write_stream(bindata, name, self._compress(jpg_data, comp_type))
+        body = storage.OpenStorage("BodyText", None,
+                                   self.STGM_READWRITE | self.STGM_SHARE_EXCLUSIVE, None, 0)
+        try:
+            for section, data in sections.items():
+                self._write_stream(body, section, data)
+            body.Commit(0)
+        finally:
+            del body
 
 
 # ─────────────────────────────────────────
@@ -1036,6 +1243,8 @@ class HwpxProcessor:
         """HWPX 파일 내 이미지 목록을 반환합니다. used=False면 변환에서 제외될 그림입니다."""
         images = []
         page_map = build_page_map_hwpx(hwpx_path)
+        rot_plan = plan_rotation_hwpx(hwpx_path)
+        rotated_entries = {rot_plan.entries.get(ref) for ref in rot_plan.in_place} if rot_plan else set()
         try:
             with zipfile.ZipFile(hwpx_path, "r") as zf:
                 entries = self._find_bindata_entries(zf)
@@ -1050,6 +1259,7 @@ class HwpxProcessor:
                         "format": fmt,
                         "size": len(data),
                         "used": not is_unused_hwpx(page_map, entry),
+                        "rotated": entry in rotated_entries,
                     })
         except Exception as e:
             emit_error(f"HWPX 스캔 실패: {e}")
@@ -1070,9 +1280,18 @@ class HwpxProcessor:
         # 사이즈 조정용: 변환된 벡터(WMF/EMF)의 '원본 바이트'를 출력 ZIP 경로로 보관.
         # size_adjust_hwpx가 다운샘플(선 흐려짐) 대신 원본 벡터를 작은 크기로 재렌더하도록.
         self.vector_origins: dict[str, tuple[str, bytes]] = {}
+        # 그중 회전을 바로 세운 그림: 출력 ZIP 경로 → 각도(재렌더 결과도 같은 각도로 돌린다)
+        self.vector_rotations: dict[str, int] = {}
         # 그림별 쪽 번호(로그 표시용). 사이즈 조정 후처리에서도 쓰도록 보관한다.
         self.page_map = build_page_map_hwpx(hwpx_path)
         refine_pages_with_hangul(self.page_map, hwpx_path)
+
+        # 회전된 그림을 바로 세울 계획(원본을 읽기만 한다). 픽셀은 아래 루프에서 돌려 두고,
+        # XML 수정은 재패키징 직전에 메모리에서 끝내 본 뒤 성공했을 때만 함께 반영한다.
+        rot_plan = plan_rotation_hwpx(hwpx_path)
+        ref_of = {entry: ref for ref, entry in rot_plan.entries.items()} if rot_plan else {}
+        rotated = {}               # ref → 돌린 jpg (제자리)
+        rot_copies = {}            # (ref, 각도) → 돌린 jpg (새 그림 사본)
 
         with zipfile.ZipFile(output_path, "r") as zf:
             entries = sort_by_page(self._find_bindata_entries(zf),
@@ -1092,7 +1311,13 @@ class HwpxProcessor:
                 note = note_hwpx(self.page_map, entry)
                 approx = is_approx_hwpx(self.page_map, entry)
 
-                if not should_convert(fmt, mode):
+                # 회전 그림은 OLE와 같은 규칙: 제자리로 세울 거면 형식과 무관하게 변환,
+                # 사본만 필요하면 원본은 규칙대로 두고 사본만 만든다.
+                ref = ref_of.get(entry)
+                rotate_here = bool(rot_plan) and ref in rot_plan.in_place
+                needs_copy = bool(rot_plan) and ref in rot_plan.copies
+                convert_this = should_convert(fmt, mode) or rotate_here
+                if not convert_this and not needs_copy:
                     skipped += 1
                     continue
 
@@ -1100,6 +1325,16 @@ class HwpxProcessor:
                     jpg_data = image_bytes_to_jpg(data, fmt)
                 except Exception as e:
                     emit_progress(False, original_name, fmt, "jpg", f"변환 실패: {e}", pages, note, approx)
+                    skipped += 1
+                    continue
+
+                if rotate_here or needs_copy:
+                    here, copies = rotate_for_plan(rot_plan, ref, original_name, jpg_data)
+                    if here is not None:
+                        rotated[ref] = here
+                    for angle, jpg in copies.items():
+                        rot_copies[(ref, angle)] = jpg
+                if not convert_this:
                     skipped += 1
                     continue
 
@@ -1119,7 +1354,42 @@ class HwpxProcessor:
         emit_approx(self.page_map)
         emit_unused(unused_names)
 
-        if not replacements:
+        # 회전 그림: 사본을 매니페스트에 넣고 구역 XML을 메모리에서 고쳐 본다. 하나라도
+        # 실패하면 회전은 원래대로 둔다(돌린 픽셀도 쓰지 않음 — 두 번 돌아가 보이지 않게).
+        rot_sections = {}          # 구역 XML 경로 → 고친 텍스트
+        rot_manifest = None        # (content.hpf 경로, 사본을 넣은 텍스트)
+        if rot_plan:
+            rot_plan.keep(set(rotated), set(rot_copies))
+        if rot_plan:
+            try:
+                with zipfile.ZipFile(output_path, "r") as zf:
+                    names = zf.namelist()
+                    if rot_plan.copies:
+                        hpf = next(n for n in names if n.lower().endswith(".hpf"))
+                        rot_manifest = (hpf, hwp_rotation.add_hwpx_copies(
+                            zf.read(hpf).decode("utf-8"), rot_plan, names))
+                    for section, targets in rot_plan.targets().items():
+                        rot_sections[section] = hwp_rotation.patch_hwpx_section(
+                            zf.read(section).decode("utf-8"), targets, rot_plan.clip_order)
+            except Exception as e:
+                rot_sections, rot_manifest = {}, None
+                emit_error(f"회전 그림 바로 세우기 실패 — 회전은 원래대로 둡니다: {e}")
+        if rot_sections:
+            for ref, jpg in rotated.items():
+                entry = rot_plan.entries[ref]
+                new_entry = replacements[entry][0]
+                replacements[entry] = (new_entry, jpg)
+                if new_entry in self.vector_origins:
+                    # 사이즈 조정이 원본 벡터를 다시 렌더할 때도 같은 각도로 돌려야 한다.
+                    self.vector_rotations[new_entry] = rot_plan.in_place[ref]
+        if rot_plan is not None:
+            emit_rotation(rot_plan, bool(rot_sections),
+                          {ref: Path(entry).name for ref, entry in rot_plan.entries.items()},
+                          lambda n: _page_fields(lookup_hwpx(self.page_map, n),
+                                                 note_hwpx(self.page_map, n),
+                                                 is_approx_hwpx(self.page_map, n)))
+
+        if not replacements and not rot_sections:
             emit_done(converted, skipped)
             return
 
@@ -1143,7 +1413,11 @@ class HwpxProcessor:
                     else:
                         # XML 파일이면 이미지 참조 수정
                         if info.filename.lower().endswith((".xml", ".hpf")):
-                            text = data.decode("utf-8", errors="replace")
+                            text = rot_sections.get(info.filename)
+                            if text is None and rot_manifest and info.filename == rot_manifest[0]:
+                                text = rot_manifest[1]
+                            if text is None:
+                                text = data.decode("utf-8", errors="replace")
                             for old_name, new_name_str in name_map.items():
                                 text = text.replace(old_name, new_name_str)
                             # OPF 매니페스트(content.hpf): 변환된 이미지의 media-type을 image/jpeg로 교체.
@@ -1169,6 +1443,13 @@ class HwpxProcessor:
                         else:
                             # 그 외 파일은 그대로 복사
                             zf_out.writestr(info, data)
+
+                # 회전 그림 사본(다른 곳에서도 쓰여 원본을 못 돌린 그림)
+                if rot_sections:
+                    for key, new_id in rot_plan.new_ids.items():
+                        copy_info = zipfile.ZipInfo(rot_plan.entries[new_id])
+                        copy_info.compress_type = zipfile.ZIP_DEFLATED
+                        zf_out.writestr(copy_info, rot_copies[key])
 
             # 임시 파일을 출력 경로로 이동
             shutil.move(tmp_path, output_path)
@@ -1244,6 +1525,37 @@ def emit_unused(names: list):
     """문서가 참조하지 않아 변환에서 제외한 그림 목록(있을 때만)."""
     if names:
         _print_json({"event": "unused", "count": len(names), "names": names[:30]})
+
+
+def emit_rotation(plan, applied: bool, name_of: dict, page_fields_of):
+    """회전 그림 처리 결과를 그림마다 한 줄씩 알립니다. name_of = 키 → 로그에 쓸 그림 이름.
+
+    applied=False면 바로 세운 그림이 없다(실패했다면 오류는 이미 알렸다). 회전돼 있지만
+    손대지 않은 그림은 사유와 함께 실패 줄로 보낸다 — PDF 변환 전에 직접 확인해야 하므로."""
+    fixed = 0
+    if applied:
+        for key, angle in plan.in_place.items():
+            name = name_of.get(key, str(key))
+            _print_json({"event": "rotate", "success": True, "name": name,
+                         "message": f"회전 {angle}° → 0° (그림을 돌려 저장)",
+                         **page_fields_of(name)})
+            fixed += 1
+        for (key, angle), copy_name in plan.copy_names.items():
+            name = name_of.get(key, str(key))
+            _print_json({"event": "rotate", "success": True, "name": name,
+                         "message": f"회전 {angle}° → 0° (다른 곳에도 쓰인 그림이라 "
+                                    f"돌린 사본 {copy_name}로 분리)",
+                         **page_fields_of(name)})
+            fixed += 1
+    kept = 0
+    for key, angle, reason in dict.fromkeys(plan.skipped):
+        name = name_of.get(key, str(key))
+        _print_json({"event": "rotate", "success": False, "name": name,
+                     "message": f"회전 {angle}° 그대로 둠 — {reason}",
+                     **page_fields_of(name)})
+        kept += 1
+    if fixed or kept:
+        _print_json({"event": "rotateDone", "fixed": fixed, "kept": kept})
 
 
 def emit_done(total_converted: int, total_skipped: int):
@@ -1346,7 +1658,8 @@ def main():
                     try:
                         size_adjust_hwpx(args.output,
                                          vector_origins=getattr(processor, "vector_origins", None),
-                                         page_map=getattr(processor, "page_map", None))
+                                         page_map=getattr(processor, "page_map", None),
+                                         vector_rotations=getattr(processor, "vector_rotations", None))
                     except Exception as e:
                         emit_error(f"사이즈 조정 실패: {e}")
             else:

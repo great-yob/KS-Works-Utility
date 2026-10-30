@@ -11,8 +11,11 @@ import {
 
 /* ─────────────── 타입 ─────────────── */
 
-/** used=false면 문서가 참조하지 않는 그림이라 변환에서 제외됩니다. */
-type ImageInfo = { name: string; format: string; size: number; used?: boolean };
+/**
+ * used=false면 문서가 참조하지 않는 그림이라 변환에서 제외됩니다.
+ * rotated=true면 한글에서 회전돼 있어 바로 세울 그림입니다(선택 정리에서도 변환됨).
+ */
+type ImageInfo = { name: string; format: string; size: number; used?: boolean; rotated?: boolean };
 
 type ConvertMode = "selective" | "all";
 
@@ -22,7 +25,7 @@ type ConvertMode = "selective" | "all";
  *  - page  : 그림이 원본 문서에서 놓인 쪽 번호(워커가 레이아웃 정보로 계산).
  *            쪽도 쓰임새도 없으면 칩을 아예 그리지 않습니다.
  */
-type LogTone = "info" | "success" | "fail" | "size";
+type LogTone = "info" | "success" | "fail" | "size" | "rotate";
 
 type LogEntry = {
   tag: string;
@@ -106,7 +109,8 @@ function countTargets(images: ImageInfo[], mode: ConvertMode): number {
   // 문서가 참조하지 않는 그림은 워커가 건드리지 않으므로 대상 수에서도 뺀다.
   const used = images.filter((img) => img.used !== false);
   if (mode === "all") return used.length;
-  return used.filter((img) => !EXCLUDE_SELECTIVE.has(img.format)).length;
+  // 회전된 그림은 바로 세우려면 다시 저장해야 하므로 형식과 무관하게 변환된다.
+  return used.filter((img) => img.rotated || !EXCLUDE_SELECTIVE.has(img.format)).length;
 }
 
 function formatBytes(bytes: number): string {
@@ -122,6 +126,7 @@ const LOG_STYLES: Record<LogTone, { row: string; tag: string; chip: string }> = 
   info: { row: "text-slate-300", tag: "text-slate-500", chip: "bg-white/10 ring-white/15" },
   success: { row: "text-slate-300", tag: "text-teal-400/90", chip: "bg-teal-400/20 ring-teal-400/30" },
   size: { row: "text-slate-300", tag: "text-amber-400/90", chip: "bg-amber-400/20 ring-amber-400/30" },
+  rotate: { row: "text-slate-300", tag: "text-violet-400/90", chip: "bg-violet-400/20 ring-violet-400/30" },
   fail: {
     row: "text-red-300 bg-red-500/10 border-l-2 border-red-400/70 pl-1.5 -ml-1.5 rounded-r",
     tag: "text-red-400 font-bold",
@@ -425,6 +430,34 @@ export default function HwpImageConverter() {
                   pageNote: data.pageNote as string | undefined,
                   pageApprox: data.pageApprox === true,
                 }),
+              ];
+              setState((prev) => ({ ...prev, logs }));
+            } else if (data.event === "rotate") {
+              // 회전 그림: 바로 세웠으면 보라색, 그대로 둔 그림은 PDF 변환 전 직접 확인하도록 실패색.
+              logs = [
+                ...logs,
+                log(
+                  data.success ? "회전" : "회전 유지",
+                  `${data.name}: ${data.message}`,
+                  data.success ? "rotate" : "fail",
+                  {
+                    withPage: true,
+                    page: data.page as number | undefined,
+                    physicalPage: data.physicalPage as number | undefined,
+                    pages: data.pages as number[] | undefined,
+                    pageNote: data.pageNote as string | undefined,
+                    pageApprox: data.pageApprox === true,
+                  }
+                ),
+              ];
+              setState((prev) => ({ ...prev, logs }));
+            } else if (data.event === "rotateDone") {
+              logs = [
+                ...logs,
+                log(
+                  "회전 완료",
+                  `바로 세움 ${data.fixed}건${data.kept ? ` / 그대로 둠 ${data.kept}건 (한글에서 직접 확인 필요)` : ""}`
+                ),
               ];
               setState((prev) => ({ ...prev, logs }));
             } else if (data.event === "approx") {

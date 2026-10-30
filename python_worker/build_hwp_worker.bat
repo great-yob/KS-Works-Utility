@@ -15,6 +15,7 @@ REM win32timezone를 지연 import하는데, 이게 빠지면 빌드는 되지�
 REM 스캔이 0개로 나오고 변환도 0개가 된다(앱에서 "이미지 0개"의 실제 원인이었음).
 REM hwp_pagemap(그림별 쪽 번호 계산)은 최상위 import라 정적 분석에 잡히지만,
 REM 빠지면 로그의 쪽 칩만 조용히 사라지므로 함께 명시해 둔다.
+REM hwp_rotation(회전 그림 바로 세우기)도 같은 이유 — 빠지면 회전이 조용히 그대로 남는다.
 pyinstaller --onefile --name hwp_worker --distpath dist ^
     --hidden-import pythoncom ^
     --hidden-import pywintypes ^
@@ -24,6 +25,7 @@ pyinstaller --onefile --name hwp_worker --distpath dist ^
     --hidden-import worker ^
     --hidden-import hwp_pagemap ^
     --hidden-import hwp_pageapi ^
+    --hidden-import hwp_rotation ^
     hwp_worker.py
 
 if errorlevel 1 (

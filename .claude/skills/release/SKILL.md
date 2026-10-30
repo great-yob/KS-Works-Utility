@@ -51,7 +51,7 @@ git diff --stat $LAST
 | 바뀐 소스 | 다시 만들 exe |
 |---|---|
 | `python_worker/worker.py` | `image_worker.exe` **와** `hwp_worker.exe` (hwp_worker가 worker를 번들) |
-| `hwp_worker.py`, `hwp_pagemap.py`, `hwp_pageapi.py` | `hwp_worker.exe` |
+| `hwp_worker.py`, `hwp_pagemap.py`, `hwp_pageapi.py`, `hwp_rotation.py` | `hwp_worker.exe` |
 
 해당 exe가 변경 목록(`git diff --stat $LAST`)에 없거나 소스보다 mtime이 오래됐으면 다시 빌드한다:
 
@@ -61,7 +61,8 @@ python -m PyInstaller --noconfirm --onefile --console --name image_worker --dist
 python -m PyInstaller --onefile --name hwp_worker --distpath dist --noconfirm \
   --hidden-import pythoncom --hidden-import pywintypes --hidden-import win32timezone \
   --hidden-import win32com --hidden-import win32com.client --hidden-import worker \
-  --hidden-import hwp_pagemap --hidden-import hwp_pageapi hwp_worker.py > "$SCRATCH/build_hwp.log" 2>&1
+  --hidden-import hwp_pagemap --hidden-import hwp_pageapi --hidden-import hwp_rotation \
+  hwp_worker.py > "$SCRATCH/build_hwp.log" 2>&1
 cp dist/image_worker.exe ../resources/image_worker/image_worker.exe
 cp dist/hwp_worker.exe   ../resources/hwp_worker/hwp_worker.exe
 ```
