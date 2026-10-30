@@ -203,8 +203,13 @@ def to_rgb(img):
 
 
 def convert_image_to_jpg(data: bytes, source_format: str, quality: int = 95) -> bytes:
-    """이미지 바이트를 JPG 바이트로 변환합니다. (PIL이 여는 일반 래스터 전용)"""
-    img = Image.open(io.BytesIO(data))
+    """이미지 바이트를 JPG 바이트로 변환합니다. (일반 래스터 전용)
+
+    PIL이 못 여는 손상 파일(포토샵도 거부하지만 그림판은 여는 PNG 등)은 worker.open_raster가
+    WIC — 그림판과 같은 Windows 디코더 — 로 다시 엽니다."""
+    sys.path.insert(0, os.path.dirname(__file__))
+    import worker
+    img = worker.open_raster(data)
     if img.mode != "RGB":
         img = to_rgb(img)
 
@@ -343,7 +348,7 @@ def _resize_jpg_bytes(data: bytes, f: float, target_dpi: int = 300) -> bytes:
     return out.getvalue()
 
 
-def size_adjust_hwpx(path: str, vector_origins: dict = None, page_map: dict = None) -> None:
+def size_adjust_hwpx(path: str, vector_origins: dict = None, page_map: PageMap = None) -> None:
     """변환 완료된 HWPX에 '사이즈 조정'을 적용한다(변환과 분리된 후처리).
 
     한글이 그림에 표시하는 '확대/축소 비율'(실측으로 확정한 식):
@@ -363,7 +368,7 @@ def size_adjust_hwpx(path: str, vector_origins: dict = None, page_map: dict = No
     되는 걸 막는다. HWPX는 자르기가 비율(imgClip/imgDim=1.0)이라 픽셀이 바뀌어도 XML 수정이
     불필요하다(OLE의 off44와 달리). EMF는 좌표 검증이 어려워 건너뛴다(원본 렌더 유지)."""
     vector_origins = vector_origins or {}
-    page_map = page_map or {}
+    page_map = page_map or PageMap()
     PIC_RE = re.compile(r'<hp:pic\b.*?</hp:pic>', re.S)
     SECTION_RE = re.compile(r'section\d+\.xml$', re.I)
 
@@ -412,7 +417,9 @@ def size_adjust_hwpx(path: str, vector_origins: dict = None, page_map: dict = No
     adjusted = 0
     skipped = 0
     for ref, (cw, ch, cfw, cfh) in ref_info.items():
-        pages = page_map.get(ref.lower())   # 로그에 붙일 쪽 번호(변환 전 이름 기준 맵)
+        # 로그에 붙일 쪽 번호(변환 전 이름 기준 맵). ref는 'image1' 같은 itemID라 확장자 없이 찾는다.
+        page_fields = _page_fields(lookup_hwpx(page_map, ref), note_hwpx(page_map, ref),
+                                   is_approx_hwpx(page_map, ref))
         if ref_count.get(ref, 0) != 1:    # 같은 이미지가 여러 곳에 다른 크기로 → 안전하게 skip
             skipped += 1
             continue
@@ -465,11 +472,11 @@ def size_adjust_hwpx(path: str, vector_origins: dict = None, page_map: dict = No
                        f"(용량 {before // 1024}KB→{len(contents[key]) // 1024}KB)")
             adjusted += 1
             _print_json({"event": "size", "name": href.split("/")[-1], "message": msg,
-                         **_page_fields(pages)})
+                         **page_fields})
         except Exception as e:
             skipped += 1
             _print_json({"event": "size", "name": href, "message": f"사이즈 조정 실패: {e}",
-                         **_page_fields(pages)})
+                         **page_fields})
 
     if adjusted == 0:
         _print_json({"event": "sizeDone", "adjusted": 0, "skipped": skipped})

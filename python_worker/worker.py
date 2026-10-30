@@ -1,8 +1,10 @@
 import argparse
+import io
 import sys
 import json
 import ctypes
 import struct
+import uuid
 import base64
 from pathlib import Path
 from PIL import Image, ImageChops
@@ -459,6 +461,73 @@ def render_wmf_window_px(wmf_path, pw, ph):
         return None
     return img
 
+# ─────────────────────────────────────────
+# WIC 래스터 디코더 (그림판과 같은 Windows 코덱)
+# ─────────────────────────────────────────
+
+class _GUID(ctypes.Structure):
+    _fields_=[("Data1",DWORD),("Data2",ctypes.c_uint16),("Data3",ctypes.c_uint16),("Data4",ctypes.c_ubyte*8)]
+def _guid(s):
+    return _GUID.from_buffer_copy(uuid.UUID(s).bytes_le)
+_CLSID_WICImagingFactory=_guid("cacaf262-9370-4615-a13b-9f5539da4c0a")
+_IID_IWICImagingFactory =_guid("ec5ec8a9-c395-4314-9c77-54d7a935ff70")
+_WICPixelFormat32bppBGRA=_guid("6fddc324-4e03-4bfe-b185-3d77768dc90f")
+
+def _wic_call(obj,idx,argtypes,*args):
+    """COM 메서드(vtable idx번)를 호출한다. HRESULT가 실패면 OSError."""
+    vt=ctypes.cast(obj,ctypes.POINTER(ctypes.POINTER(LPVOID))).contents
+    hr=ctypes.WINFUNCTYPE(ctypes.c_long,LPVOID,*argtypes)(vt[idx])(obj,*args)
+    if hr<0: raise OSError(f"WIC 0x{hr&0xFFFFFFFF:08X}")
+    return hr
+
+def decode_wic(data):
+    """이미지 바이트를 WIC(Windows Imaging Component)로 디코딩해 PIL RGBA 이미지로 돌려준다.
+
+    그림판·사진 앱이 쓰는 디코더라, PIL·포토샵이 '올바른 파일이 아니다'라며 거부하는 그림도
+    연다. 예: PNG 청크의 CRC(체크섬)가 깨진 파일 — PIL·포토샵은 IHDR CRC가 틀리면 거부하지만
+    WIC는 검사하지 않는다. 끝이 잘린 파일도 남은 데이터까지 그려 준다.
+    COM은 STA로 초기화한다(pythoncom 기본값과 같아 한글 COM 경로와 충돌하지 않음)."""
+    ole32=ctypes.oledll.ole32
+    try: ole32.CoInitializeEx(None,2)                 # COINIT_APARTMENTTHREADED. 이미 초기화돼 있으면 무시
+    except OSError: pass
+    P=ctypes.POINTER(LPVOID)
+    fac=LPVOID()
+    ole32.CoCreateInstance(ctypes.byref(_CLSID_WICImagingFactory),None,1,
+                           ctypes.byref(_IID_IWICImagingFactory),ctypes.byref(fac))
+    objs=[fac]; src=ctypes.create_string_buffer(data,len(data))
+    try:
+        stm=LPVOID(); _wic_call(fac,14,[P],ctypes.byref(stm)); objs.append(stm)                    # CreateStream
+        _wic_call(stm,16,[LPVOID,DWORD],src,len(data))                                              # InitializeFromMemory
+        dec=LPVOID(); _wic_call(fac,4,[LPVOID,LPVOID,DWORD,P],stm,None,0,ctypes.byref(dec)); objs.append(dec)  # CreateDecoderFromStream
+        frm=LPVOID(); _wic_call(dec,13,[UINT,P],0,ctypes.byref(frm)); objs.append(frm)              # GetFrame(0)
+        cnv=LPVOID(); _wic_call(fac,10,[P],ctypes.byref(cnv)); objs.append(cnv)                     # CreateFormatConverter
+        _wic_call(cnv,8,[LPVOID,LPVOID,INT,LPVOID,ctypes.c_double,INT],
+                  frm,ctypes.byref(_WICPixelFormat32bppBGRA),0,None,0.0,0)                          # Initialize → BGRA
+        w,h=UINT(),UINT(); _wic_call(cnv,3,[LPVOID,LPVOID],ctypes.byref(w),ctypes.byref(h))         # GetSize
+        dx,dy=ctypes.c_double(),ctypes.c_double()
+        _wic_call(frm,5,[LPVOID,LPVOID],ctypes.byref(dx),ctypes.byref(dy))                          # GetResolution
+        stride=w.value*4; px=ctypes.create_string_buffer(stride*h.value)
+        _wic_call(cnv,7,[LPVOID,UINT,UINT,LPVOID],None,stride,len(px),px)                           # CopyPixels
+        img=Image.frombytes("RGBA",(w.value,h.value),px,"raw","BGRA")
+        img.info["dpi"]=(dx.value or 96,dy.value or 96)
+        return img
+    finally:
+        for o in reversed(objs): _wic_call(o,2,[])                                                  # Release
+
+def open_raster(data):
+    """래스터 이미지 바이트를 PIL 이미지로 연다. PIL이 거부하면 WIC(그림판과 같은 디코더)로 다시 연다.
+
+    PIL이 여는 그림은 지금까지와 똑같이 PIL로 처리하고(결과 불변), PIL이 실패한 그림만 WIC로
+    간다. 둘 다 실패하면 두 오류를 함께 담아 올린다."""
+    try:
+        img=Image.open(io.BytesIO(data)); img.load(); return img
+    except Exception as e:
+        pil_err=e
+    try:
+        return decode_wic(data)
+    except Exception as e:
+        raise OSError(f"{pil_err} / Windows 디코더: {e}") from pil_err
+
 def trim_whitespace(img):
     bg=Image.new(img.mode,img.size,img.getpixel((0,0)))
     diff=ImageChops.difference(img,bg); bbox=diff.getbbox()
@@ -483,8 +552,8 @@ def convert_single(file_path, output_dir, dpi, uppercase_ext):
             img = render_emf_gdi(file, dpi)
             img = trim_whitespace(img)
         else:
-            img = Image.open(file)
-            
+            img = open_raster(file.read_bytes())
+
         if img.mode != "RGB":
             img = to_rgb(img)
             
