@@ -14,8 +14,20 @@ import {
 /**
  * used=false면 문서가 참조하지 않는 그림이라 변환에서 제외됩니다.
  * rotated=true면 한글에서 회전돼 있어 바로 세울 그림입니다(선택 정리에서도 변환됨).
+ * nameExt가 있으면 이름의 확장자와 실제 내용(format)이 다른 그림입니다 — 예: 이름은 png인데
+ * 내용은 JPEG라 포토샵이 열지 못함. 선택 정리에서도 .jpg로 맞춥니다.
  */
-type ImageInfo = { name: string; format: string; size: number; used?: boolean; rotated?: boolean };
+type ImageInfo = {
+  name: string;
+  format: string;
+  size: number;
+  used?: boolean;
+  rotated?: boolean;
+  nameExt?: string;
+};
+
+/** 형식 요약용 이름. 확장자가 내용과 다른 그림은 "jpg(.png)"처럼 둘 다 보여 줍니다. */
+const formatLabel = (img: ImageInfo) => (img.nameExt ? `${img.format}(.${img.nameExt})` : img.format);
 
 type ConvertMode = "selective" | "all";
 
@@ -25,7 +37,7 @@ type ConvertMode = "selective" | "all";
  *  - page  : 그림이 원본 문서에서 놓인 쪽 번호(워커가 레이아웃 정보로 계산).
  *            쪽도 쓰임새도 없으면 칩을 아예 그리지 않습니다.
  */
-type LogTone = "info" | "success" | "fail" | "size" | "rotate";
+type LogTone = "info" | "success" | "fail" | "size" | "rotate" | "layout";
 
 type LogEntry = {
   tag: string;
@@ -83,7 +95,8 @@ type OptionId = "all-size" | "all-format" | "sel-size" | "sel-format";
 
 /**
  * 정리 옵션은 두 축의 조합입니다.
- *   범위: 전체(all) / 선택(selective, 문제 이미지만 — jpg/bmp/emf 제외)
+ *   범위: 전체(all) / 선택(selective, 문제 이미지만 — jpg/bmp/emf 제외.
+ *         단 회전 그림과 이름·내용이 다른 그림은 형식과 무관하게 포함)
  *   방식: JPG+사이즈(변환 후 사이즈 조정까지) / JPG(형식만 변환)
  * mode·sizeAdjust 둘 다 백엔드 /api/hwp-image/convert 로 전달됩니다.
  */
@@ -100,7 +113,7 @@ const CLEANUP_OPTIONS: {
   { id: "sel-format", label: "선택 정리 (JPG)", desc: "문제 이미지 형식만 정리", mode: "selective", sizeAdjust: false },
 ];
 
-const DEFAULT_OPTION: OptionId = "all-size";
+const DEFAULT_OPTION: OptionId = "sel-format";
 
 /** 선택 정리 시 제외할 형식(이미 정상인 형식) */
 const EXCLUDE_SELECTIVE = new Set(["jpg", "jpeg", "bmp", "emf"]);
@@ -109,8 +122,9 @@ function countTargets(images: ImageInfo[], mode: ConvertMode): number {
   // 문서가 참조하지 않는 그림은 워커가 건드리지 않으므로 대상 수에서도 뺀다.
   const used = images.filter((img) => img.used !== false);
   if (mode === "all") return used.length;
-  // 회전된 그림은 바로 세우려면 다시 저장해야 하므로 형식과 무관하게 변환된다.
-  return used.filter((img) => img.rotated || !EXCLUDE_SELECTIVE.has(img.format)).length;
+  // 회전된 그림은 바로 세우려면 다시 저장해야 하고, 확장자가 내용과 다른 그림은 이름을
+  // 맞춰야 하므로 형식과 무관하게 변환된다.
+  return used.filter((img) => img.rotated || img.nameExt || !EXCLUDE_SELECTIVE.has(img.format)).length;
 }
 
 function formatBytes(bytes: number): string {
@@ -127,6 +141,7 @@ const LOG_STYLES: Record<LogTone, { row: string; tag: string; chip: string }> = 
   success: { row: "text-slate-300", tag: "text-teal-400/90", chip: "bg-teal-400/20 ring-teal-400/30" },
   size: { row: "text-slate-300", tag: "text-amber-400/90", chip: "bg-amber-400/20 ring-amber-400/30" },
   rotate: { row: "text-slate-300", tag: "text-violet-400/90", chip: "bg-violet-400/20 ring-violet-400/30" },
+  layout: { row: "text-slate-300", tag: "text-sky-400/90", chip: "bg-sky-400/20 ring-sky-400/30" },
   fail: {
     row: "text-red-300 bg-red-500/10 border-l-2 border-red-400/70 pl-1.5 -ml-1.5 rounded-r",
     tag: "text-red-400 font-bold",
@@ -294,12 +309,14 @@ export default function HwpImageConverter() {
         const targetCount = countTargets(data.images, mode);
         const formatCounts: Record<string, number> = {};
         data.images.forEach((img: ImageInfo) => {
-          formatCounts[img.format] = (formatCounts[img.format] || 0) + 1;
+          const key = formatLabel(img);
+          formatCounts[key] = (formatCounts[key] || 0) + 1;
         });
 
         const summary = Object.entries(formatCounts)
           .map(([fmt, cnt]) => `${fmt}:${cnt}`)
           .join(", ");
+        const mismatched = (data.images as ImageInfo[]).filter((img) => img.nameExt && img.used !== false);
 
         // 스캔 결과 저장 후 바로 변환 시작
         setState((prev) => ({
@@ -311,6 +328,14 @@ export default function HwpImageConverter() {
           logs: [
             ...prev.logs,
             log("스캔 완료", `전체 ${data.images.length}개 이미지 (${summary})`),
+            ...(mismatched.length > 0
+              ? [
+                  log(
+                    "확장자",
+                    `이름과 실제 형식이 다른 그림 ${mismatched.length}개 — 포토샵 등에서 열리지 않으므로 .jpg로 맞춥니다`,
+                  ),
+                ]
+              : []),
             log("대상", `변환 대상: ${targetCount}개`),
           ],
         }));
@@ -396,10 +421,14 @@ export default function HwpImageConverter() {
               };
               if (data.success) {
                 converted++;
-                logs = [
-                  ...logs,
-                  log("성공", `${data.name}: ${data.from} → ${data.to}`, "success", pageInfo),
-                ];
+                // nameExt: 이름의 확장자가 실제 내용(from)과 달랐던 그림. kept면 내용이 이미
+                // JPEG라 다시 인코딩하지 않고 이름만 맞췄다.
+                const text = data.nameExt
+                  ? data.kept
+                    ? `${data.name}: 확장자 정정 ${data.nameExt} → ${data.to} (내용은 원래 JPG · 재압축 없음)`
+                    : `${data.name}: ${data.nameExt}(실제 ${data.from}) → ${data.to}`
+                  : `${data.name}: ${data.from} → ${data.to}`;
+                logs = [...logs, log("성공", text, "success", pageInfo)];
               } else {
                 skippedCount++;
                 logs = [
@@ -449,6 +478,20 @@ export default function HwpImageConverter() {
                     pageApprox: data.pageApprox === true,
                   }
                 ),
+              ];
+              setState((prev) => ({ ...prev, logs }));
+            } else if (data.event === "wrap") {
+              // 투명 배경 그림을 '글 앞으로' → '글 뒤로' 옮김(JPG의 흰 바탕이 글자를 가리지 않게).
+              logs = [
+                ...logs,
+                log("배치", `${data.name}: ${data.message}`, "layout", {
+                  withPage: true,
+                  page: data.page as number | undefined,
+                  physicalPage: data.physicalPage as number | undefined,
+                  pages: data.pages as number[] | undefined,
+                  pageNote: data.pageNote as string | undefined,
+                  pageApprox: data.pageApprox === true,
+                }),
               ];
               setState((prev) => ({ ...prev, logs }));
             } else if (data.event === "rotateDone") {
@@ -658,7 +701,8 @@ export default function HwpImageConverter() {
                           {(() => {
                             const counts: Record<string, number> = {};
                             state.images.forEach((img) => {
-                              counts[img.format] = (counts[img.format] || 0) + 1;
+                              const key = formatLabel(img);
+                              counts[key] = (counts[key] || 0) + 1;
                             });
                             return Object.entries(counts).map(([fmt, cnt]) => (
                               <span key={fmt}>{fmt}:{cnt}</span>

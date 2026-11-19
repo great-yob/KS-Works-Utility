@@ -154,14 +154,19 @@ def rotate_jpg(data: bytes, angle: int) -> bytes:
 class RotationPlan:
     """바로 세울 그림 목록. 비어 있으면(False) 아무것도 바꾸지 않는다.
 
-    키(key)는 그림 데이터를 가리키는 값이다 — OLE는 bin id(int), HWPX는 binaryItemIDRef(str).
+    키(key)는 그림 데이터를 가리키는 값이다 — OLE는 **스트림 번호**(BINxxxx의 xxxx, int),
+    HWPX는 binaryItemIDRef(str). OLE 그림 레코드에 적힌 번호(그림 번호)는 스트림 번호와 다를
+    수 있어(연결 그림 뒤로 밀림 — hwp_pagemap.bin_item_streams) bin_items 표로 옮긴다.
 
     usages     : [(구역 이름, 구역 안 몇 번째 그림, 키, 각도, 자르기 프레임)] — 고칠 그림 하나하나.
                  자르기 프레임은 HWPX만 쓴다(OLE는 레코드에 원본 크기가 있어 None).
     in_place   : 키 → 각도. 그 그림을 쓰는 곳이 전부 같은 각도라 픽셀을 제자리에서 돌린다.
     copies     : 키 → [각도]. 다른 곳에서도 쓰여 돌린 사본을 새 그림으로 추가한다.
-    new_ids    : (키, 각도) → 사본의 새 키. 사본 목록(DocInfo/매니페스트)에 넣은 뒤 채워진다.
+    new_ids    : (키, 각도) → 사본을 가리킬 새 값. OLE는 그림 레코드에 적을 새 그림 번호,
+                 HWPX는 새 binaryItemIDRef. 사본 목록(DocInfo/매니페스트)에 넣은 뒤 채워진다.
+    copy_streams: OLE (키, 각도) → 사본 스트림 번호(새 그림 번호와 다를 수 있다)
     copy_names : (키, 각도) → 사본 파일 이름(로그 표시용)
+    bin_items  : OLE 그림 번호 → 스트림 번호 표(DocInfo). HWPX는 None.
     entries    : HWPX 키 → ZIP 안 그림 경로
     clip_order : HWPX imgClip 표기(hwpx_clip_order)
     skipped    : [(키, 각도, 사유)] — 회전돼 있지만 손대지 않는 그림
@@ -172,7 +177,9 @@ class RotationPlan:
         self.in_place: dict = {}
         self.copies: dict = {}
         self.new_ids: dict = {}
+        self.copy_streams: dict = {}
         self.copy_names: dict = {}
+        self.bin_items = None
         self.entries: dict = {}
         self.clip_order: tuple = CLIP_LABELLED
         self.skipped: list = []
@@ -283,7 +290,7 @@ def _shape_fill_refs(shape: bytes) -> set:
 
 
 def _docinfo_refs(ole):
-    """DocInfo의 그림 채우기·그림 글머리표가 참조하는 bin id. 모르면 None(전부 공유로 본다)."""
+    """DocInfo의 그림 채우기·그림 글머리표가 참조하는 그림 번호. 모르면 None(전부 공유로 본다)."""
     try:
         from hwp_pagemap import PageMap, _collect_docinfo_refs
         page_map = PageMap()
@@ -291,6 +298,15 @@ def _docinfo_refs(ole):
         return set(page_map.used)
     except Exception:
         return None
+
+
+def _bin_items(ole) -> dict:
+    """그림 번호 → 스트림 번호 표(hwp_pagemap.bin_item_streams). 못 읽으면 빈 dict."""
+    try:
+        from hwp_pagemap import bin_item_streams
+        return bin_item_streams(_decompress(ole.openstream("DocInfo").read()))
+    except Exception:
+        return {}
 
 
 def _section_names(ole) -> list:
@@ -308,9 +324,19 @@ def plan_hwp(hwp_path: str) -> RotationPlan:
     except Exception:
         return plan
     try:
+        # 그림 레코드에 적힌 번호는 스트림 번호와 다를 수 있다(연결 그림 뒤로 밀림). 표를
+        # 못 읽으면 어느 픽셀을 돌려야 할지 확신할 수 없으므로 아무것도 돌리지 않는다.
+        items = _bin_items(ole)
+        if not items:
+            return plan
+        plan.bin_items = items
+
+        def streams(refs):
+            return {items[r] for r in refs if r in items}
+
         fixable = []
-        plain = set()               # 회전 없이(또는 못 고치고) 그대로 쓰이는 bin
-        other_refs = set()          # 본문 그림이 아닌 참조(그리기 개체 채우기, OLE)
+        plain = set()               # 회전 없이(또는 못 고치고) 그대로 쓰이는 스트림
+        other_refs = set()          # 본문 그림이 아닌 참조(그리기 개체 채우기, OLE) — 그림 번호
         for name in _section_names(ole):
             data = _decompress(ole.openstream(["BodyText", name]).read())
             ctrls, shapes = {}, {}
@@ -326,22 +352,28 @@ def plan_hwp(hwp_path: str) -> RotationPlan:
                 elif tag == TAG_SHAPE_PICTURE and end - start > PIC_BIN_ID + 1:
                     ordinal += 1
                     pic = data[start:end]
-                    bin_id = struct.unpack_from("<H", pic, PIC_BIN_ID)[0]
+                    item = struct.unpack_from("<H", pic, PIC_BIN_ID)[0]
+                    key = items.get(item)
                     shape = shapes.get(level - 1)
                     gso = ctrls.get(level - 2)
                     box = (struct.unpack_from("<2i", gso, 16)
                            if gso and gso[0:4] == GSO_CTRL_ID and len(gso) >= 24 else None)
                     angle, reason = _check_picture(shape, pic, box) if shape else (0, None)
-                    if angle and reason is None:
-                        fixable.append((name, ordinal, bin_id, angle, None))
-                    else:
-                        plain.add(bin_id)
+                    if key is None:
+                        # 연결 그림(문서 밖 파일)은 돌릴 픽셀이 문서 안에 없다.
                         if angle:
-                            plan.skipped.append((bin_id, angle, reason))
+                            plan.skipped.append((f"연결 그림 #{item}", angle,
+                                                 "문서에 포함되지 않은(연결된) 그림"))
+                    elif angle and reason is None:
+                        fixable.append((name, ordinal, key, angle, None))
+                    else:
+                        plain.add(key)
+                        if angle:
+                            plan.skipped.append((key, angle, reason))
 
         docinfo_refs = _docinfo_refs(ole)
-        plan._split(fixable, lambda b: (docinfo_refs is None or b in docinfo_refs
-                                        or b in plain or b in other_refs))
+        shared = None if docinfo_refs is None else streams(docinfo_refs) | streams(other_refs)
+        plan._split(fixable, lambda k: shared is None or k in shared or k in plain)
     except Exception:
         return RotationPlan()
     finally:
@@ -352,11 +384,15 @@ def plan_hwp(hwp_path: str) -> RotationPlan:
     return plan
 
 
-def add_bin_copies(docinfo: bytes, plan: RotationPlan, ext: str = "jpg") -> bytes:
+def add_bin_copies(docinfo: bytes, plan: RotationPlan, ext: str = "jpg",
+                   taken_streams=()) -> bytes:
     """돌린 사본용 BIN_DATA 레코드를 DocInfo 끝 BinData 목록 뒤에 붙이고 plan.new_ids를 채웁니다.
 
-    새 id는 기존 개수 다음부터 차례로(BinData ID = 등장 순서). ID_MAPPINGS의 첫 값(BinData
-    개수)도 늘린다. 임베딩이 아닌(연결) 그림은 사본을 만들 수 없어 건너뛴다."""
+    새 레코드의 그림 번호는 기존 개수 다음부터 차례로(그림 번호 = 등장 순서) — 그림 레코드에는
+    이 값(new_ids)을 적는다. 사본 스트림 번호(copy_streams, 레코드의 binId)는 그림 번호와 따로
+    정한다: 연결 그림이 있는 문서는 둘이 어긋나 있으므로, 기존 레코드·스트림(taken_streams)이
+    쓰지 않는 번호를 고른다. 번호가 안 밀린 문서에서는 둘 다 '개수 + 1'부터라 예전과 같다.
+    ID_MAPPINGS의 첫 값(BinData 개수)도 늘린다. 임베딩이 아닌 그림은 사본을 만들 수 없어 건너뛴다."""
     records = list(_iter_records(docinfo))
     id_map = next((r for r in records if r[0] == TAG_ID_MAPPINGS), None)
     bins = [r for r in records if r[0] == TAG_BIN_DATA]
@@ -366,31 +402,44 @@ def add_bin_copies(docinfo: bytes, plan: RotationPlan, ext: str = "jpg") -> byte
     if count != len(bins):
         raise ValueError("DocInfo의 BinData 개수가 맞지 않습니다")
 
+    by_stream = {}                  # 스트림 번호 → 그 스트림을 가리키는 레코드
+    used_streams = set(taken_streams) | {count}
+    for record in bins:
+        start, end = record[3], record[4]
+        if end - start >= 4 and (struct.unpack_from("<H", docinfo, start)[0] & 0x000F) != 0:
+            stream = struct.unpack_from("<H", docinfo, start + 2)[0]
+            by_stream.setdefault(stream, record)
+            used_streams.add(stream)
+
     added = bytearray()
-    next_id = count + 1
-    for bin_id in sorted(plan.copies):
-        if not 1 <= bin_id <= count:
+    next_item = count + 1
+    next_stream = max(used_streams) + 1
+    for key in sorted(plan.copies):
+        record = by_stream.get(key)
+        if record is None:
             continue
-        _tag, level, _hdr, start, _end = bins[bin_id - 1]
+        _tag, level, _hdr, start, _end = record
         prop = struct.unpack_from("<H", docinfo, start)[0]
         if (prop & 0x000F) != 1:
-            for angle in plan.copies[bin_id]:
-                plan.skipped.append((bin_id, angle, "문서에 포함되지 않은(연결된) 그림"))
+            for angle in plan.copies[key]:
+                plan.skipped.append((key, angle, "그림 데이터 형식이 달라 사본을 만들 수 없음"))
             continue
-        for angle in plan.copies[bin_id]:
-            payload = (struct.pack("<HHH", prop, next_id, len(ext))
+        for angle in plan.copies[key]:
+            payload = (struct.pack("<HHH", prop, next_stream, len(ext))
                        + ext.encode("utf-16-le"))
             added += _record_header(TAG_BIN_DATA, level, len(payload)) + payload
-            plan.new_ids[(bin_id, angle)] = next_id
-            plan.copy_names[(bin_id, angle)] = f"BIN{next_id:04X}.{ext}"
-            next_id += 1
+            plan.new_ids[(key, angle)] = next_item
+            plan.copy_streams[(key, angle)] = next_stream
+            plan.copy_names[(key, angle)] = f"BIN{next_stream:04X}.{ext}"
+            next_item += 1
+            next_stream += 1
     if not added:
         return docinfo
 
     out = bytearray(docinfo)
     insert_at = bins[-1][4]
     out[insert_at:insert_at] = added
-    struct.pack_into("<i", out, id_map[3], next_id - 1)    # 삽입 위치가 뒤라 offset 그대로
+    struct.pack_into("<i", out, id_map[3], next_item - 1)  # 삽입 위치가 뒤라 offset 그대로
     return bytes(out)
 
 
@@ -415,10 +464,11 @@ def _rewrite_picture(buf: bytearray, shape_off: int, pic_off: int, angle: int):
     struct.pack_into("<2i", buf, pic_off + PIC_ORIGINAL, ow, oh)
 
 
-def patch_section(data: bytes, targets: dict) -> bytes:
-    """구역 1개에서 targets = {몇 번째 그림: (bin id, 각도, 새 bin id | None, _)}를 바로 세웁니다.
+def patch_section(data: bytes, targets: dict, bin_items: dict = None) -> bytes:
+    """구역 1개에서 targets = {몇 번째 그림: (스트림 번호, 각도, 새 그림 번호 | None, _)}를
+    바로 세웁니다. bin_items = 그림 번호 → 스트림 번호 표(plan.bin_items).
 
-    계획을 세울 때와 같은 순서로 그림을 세므로, bin id가 계획과 다르면 예외로 멈춘다."""
+    계획을 세울 때와 같은 순서로 그림을 세므로, 가리키는 스트림이 계획과 다르면 예외로 멈춘다."""
     buf = bytearray(data)
     shapes = {}
     ordinal = -1
@@ -431,8 +481,9 @@ def patch_section(data: bytes, targets: dict) -> bytes:
             target = targets.get(ordinal)
             if target is None:
                 continue
-            bin_id, angle, new_id, _frame = target
-            if struct.unpack_from("<H", buf, start + PIC_BIN_ID)[0] != bin_id:
+            key, angle, new_id, _frame = target
+            item = struct.unpack_from("<H", buf, start + PIC_BIN_ID)[0]
+            if (bin_items.get(item) if bin_items is not None else item) != key:
                 raise ValueError("그림 순서가 계획과 다릅니다")
             _rewrite_picture(buf, shapes[level - 1] + 8, start, angle)
             if new_id:

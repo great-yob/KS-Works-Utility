@@ -28,6 +28,7 @@ try:
     from hwp_pagemap import (
         PageMap,
         apply_exact_pages,
+        bin_item_streams,
         build_page_map_hwp,
         build_page_map_hwpx,
         is_approx_hwp,
@@ -46,6 +47,9 @@ except Exception:                                   # pragma: no cover - 방어�
 
     def apply_exact_pages(page_map, resolver):
         return False
+
+    def bin_item_streams(docinfo):                  # 표를 모르면 그림 번호에 기대는 일을 하지 않는다
+        return {}
 
     def build_page_map_hwp(path):
         return PageMap()
@@ -232,6 +236,155 @@ def should_convert(fmt: str, mode: str) -> bool:
 
 
 # ─────────────────────────────────────────
+# 확장자 정합성 (이름과 실제 내용이 다른 그림)
+# ─────────────────────────────────────────
+#
+# 그림의 이름(BINxxxx.png, DocInfo 확장자, HWPX href)과 실제 내용이 다른 문서가 있다.
+# 실측: 한국양성평등교육진흥원 교재 첫 장 로고 BIN001B.png 의 내용은 온전한 JPEG였다.
+# 한글·그림판은 내용을 보고 열어서 멀쩡히 보이지만, 포토샵처럼 확장자로 해석기를 고르는
+# 프로그램은 '파일 형식 모듈이 파일을 분석할 수 없다'며 거부한다. 내용(시그니처)으로만
+# 형식을 판정하던 '선택 정리'는 이 그림을 '이미 JPG'로 보고 건너뛰어 그대로 남겼다.
+# 그래서 이름과 내용이 다르면 형식과 무관하게 변환 대상으로 삼고, 결과는 항상 .jpg 이름에
+# JPEG 내용으로 맞춘다. 내용이 이미 JPEG이면 다시 인코딩하지 않고 이름만 바꾼다(무손실).
+
+# 같은 형식의 다른 표기 → detect_format이 쓰는 이름
+_EXT_ALIASES = {"jpeg": "jpg", "jpe": "jpg", "jfif": "jpg", "tiff": "tif"}
+# 이름·내용 비교는 둘 다 그림 형식일 때만 한다(.OLE 등 그림이 아닌 BinData는 제외).
+_IMAGE_FORMATS = {"png", "jpg", "gif", "bmp", "tif", "webp", "emf", "wmf"}
+
+
+def name_ext(name: str) -> str:
+    """이름의 확장자를 detect_format과 같은 표기로 돌려줍니다(jpeg→jpg, tiff→tif). 없으면 ""."""
+    ext = Path(name).suffix.lower().lstrip(".")
+    return _EXT_ALIASES.get(ext, ext)
+
+
+def ext_mismatch(name: str, fmt: str) -> bool:
+    """이름의 확장자와 실제 내용(시그니처로 감지한 fmt)이 다른 그림인지 확인합니다.
+    .jpeg/.jpg처럼 표기만 다른 경우는 같은 형식으로 보고, 어느 한쪽이라도 그림 형식이
+    아니면(내용을 모름 등) False — 확실히 다른 그림만 고친다."""
+    ext = name_ext(name)
+    return ext in _IMAGE_FORMATS and fmt in _IMAGE_FORMATS and ext != fmt
+
+
+def to_jpg_for_mode(data: bytes, fmt: str, mode: str, mismatch: bool) -> tuple[bytes, bool, bool]:
+    """변환 대상 그림을 JPG 바이트로 만듭니다.
+    (jpg 바이트, 원본 그대로 썼는지, 투명한 부분이 흰색으로 채워졌는지)를 돌려줍니다.
+
+    이름만 틀렸고 내용이 이미 JPEG인 그림은, 이 모드가 JPG를 다시 인코딩하지 않는 경우
+    ('선택 정리') 원본 바이트를 그대로 쓴다 — 확장자만 맞추고 화질·용량은 그대로다."""
+    if mismatch and fmt == "jpg" and not should_convert(fmt, mode):
+        return data, True, False
+    jpg, see_through = image_bytes_to_jpg(data, fmt)
+    return jpg, False, see_through
+
+
+# ─────────────────────────────────────────
+# 투명 배경 그림 → 글 뒤로
+# ─────────────────────────────────────────
+#
+# JPG에는 투명이 없어 PNG의 투명한 부분이 흰색으로 채워진다. 그 그림이 '글 앞으로' 놓여
+# 글자 위에 겹쳐 있으면 흰 상자가 글자를 가린다(실측: 서명 그림 밑의 '(직인)'·'(인)'이 사라짐,
+# 과학전시 심사자료집 내지 34쪽). 한글에서 그 그림을 '글 뒤로'로 바꾸면 원본과 같아졌다
+# (렌더 차이 = JPG 잡음, 쪽 수 그대로). '맨 뒤로'(개체 순서)는 결과가 같았고, 다른 개체 위에
+# 겹친 그림이면 오히려 그 개체 밑으로 숨기 때문에 하지 않는다.
+#   * 바꾸는 것은 '본문과의 배치' 값 하나뿐이다. 한글이 같은 변경을 저장한 파일과 비교해
+#     OLE는 개체 공통 속성 21~23비트(3 → 2)만 달랐다. HWPX는 <hp:pic textWrap>.
+#   * '글 앞으로'일 때만 바꾼다: 글 앞으로·글 뒤로는 둘 다 본문 글을 밀어내지 않아 쪽 구성이
+#     그대로다. 어울림·자리 차지를 바꾸면 글이 다시 흘러 쪽이 바뀌므로 손대지 않는다.
+#   * 묶음 안의 그림(배치는 묶음 전체의 것)과 글자처럼 취급한 그림은 건너뛴다.
+#   * 글 뒤로가 해결하지 못하는 경우: 투명한 부분 밑이 글자가 아니라 색 있는 표 칸·도형·다른
+#     그림이면 흰 상자는 그대로 남는다(흰색을 그 배경색으로 바꿀 정보가 문서에 없다).
+
+GSO_CTRL_ID = b" osg"                   # CTRL_HEADER 개체 ID 'gso '(뒤집혀 저장)
+PIC_SHAPE_ID = b"cip$"                  # SHAPE_COMPONENT 개체 ID '$pic'
+WRAP_SHIFT = 21                         # 개체 공통 속성: 본문과의 배치(3비트)
+WRAP_MASK = 0x7 << WRAP_SHIFT
+WRAP_BEHIND_TEXT = 2                    # 0 어울림, 1 자리 차지, 2 글 뒤로, 3 글 앞으로
+WRAP_IN_FRONT_OF_TEXT = 3
+TREAT_AS_CHAR = 0x1                     # 개체 공통 속성 0비트: 글자처럼 취급
+
+
+def _iter_ole_records(data: bytes):
+    """레코드를 (tag, level, 본문 시작, 본문 끝)으로 순회합니다."""
+    pos, n = 0, len(data)
+    while pos + 4 <= n:
+        header = struct.unpack_from("<I", data, pos)[0]
+        tag, level, size = header & 0x3FF, (header >> 10) & 0x3FF, (header >> 20) & 0xFFF
+        hdr = 4
+        if size == 0xFFF:
+            if pos + 8 > n:
+                break
+            size = struct.unpack_from("<I", data, pos + 4)[0]
+            hdr = 8
+        start = pos + hdr
+        if start + size > n:
+            break
+        yield tag, level, start, start + size
+        pos = start + size
+
+
+def move_behind_text(section: bytes, bin_items: dict, streams: set) -> tuple[bytes, dict]:
+    """OLE 구역 1개에서 '글 앞으로' 놓인 투명 배경 그림을 '글 뒤로' 옮깁니다(길이 불변).
+
+    streams = 투명한 부분이 흰색이 된 그림의 스트림 번호, bin_items = 그림 번호 → 스트림 번호.
+    (고친 바이트, {스트림 번호: 옮긴 개수})를 돌려줍니다."""
+    buf = bytearray(section)
+    ctrls, shapes = {}, {}
+    moved: dict = {}
+    for tag, level, start, end in _iter_ole_records(section):
+        if tag == 71:                                       # CTRL_HEADER
+            ctrls[level] = (start, end)
+        elif tag == 76:                                     # SHAPE_COMPONENT
+            shapes[level] = (start, end)
+        elif tag == 85 and end - start > 72:                # PICTURE
+            stream = bin_items.get(struct.unpack_from("<H", section, start + 71)[0])
+            if stream not in streams:
+                continue
+            shape, gso = shapes.get(level - 1), ctrls.get(level - 2)
+            # 최상위 그림만: 그림 자신의 개체 ID가 두 번 들어간 모양 + 바로 위가 gso 개체
+            if not shape or section[shape[0]:shape[0] + 8] != PIC_SHAPE_ID * 2:
+                continue
+            if not gso or gso[1] - gso[0] < 8 or section[gso[0]:gso[0] + 4] != GSO_CTRL_ID:
+                continue
+            attr = struct.unpack_from("<I", buf, gso[0] + 4)[0]
+            if attr & TREAT_AS_CHAR or (attr & WRAP_MASK) >> WRAP_SHIFT != WRAP_IN_FRONT_OF_TEXT:
+                continue
+            struct.pack_into("<I", buf, gso[0] + 4,
+                             (attr & ~WRAP_MASK) | (WRAP_BEHIND_TEXT << WRAP_SHIFT))
+            moved[stream] = moved.get(stream, 0) + 1
+    return bytes(buf), moved
+
+
+_HWPX_PIC_RE = re.compile(r"<hp:pic\b.*?</hp:pic>", re.S)
+
+
+def move_behind_text_hwpx(section_xml: str, refs: set) -> tuple[str, dict]:
+    """HWPX 구역 XML에서 '글 앞으로' 놓인 투명 배경 그림을 '글 뒤로' 옮깁니다.
+    refs = 그런 그림의 binaryItemIDRef. (고친 XML, {ref: 옮긴 개수})"""
+    moved: dict = {}
+
+    def fix(m):
+        block = m.group(0)
+        ref = re.search(r'binaryItemIDRef="([^"]+)"', block)
+        if not ref or ref.group(1) not in refs:
+            return block
+        head_end = block.find(">") + 1
+        head = block[:head_end]
+        if 'textWrap="IN_FRONT_OF_TEXT"' not in head:
+            return block
+        group = re.search(r'\bgroupLevel="(\d+)"', head)
+        if group and group.group(1) != "0":
+            return block                                    # 묶음 안
+        if re.search(r'<hp:pos\b[^>]*\btreatAsChar="1"', block):
+            return block
+        moved[ref.group(1)] = moved.get(ref.group(1), 0) + 1
+        return head.replace('textWrap="IN_FRONT_OF_TEXT"', 'textWrap="BEHIND_TEXT"') + block[head_end:]
+
+    return _HWPX_PIC_RE.sub(fix, section_xml), moved
+
+
+# ─────────────────────────────────────────
 # 이미지 변환 (기존 worker.py의 to_rgb 재사용)
 # ─────────────────────────────────────────
 
@@ -250,14 +403,38 @@ def to_rgb(img):
     return img.convert("RGB")
 
 
-def convert_image_to_jpg(data: bytes, source_format: str, quality: int = 95) -> bytes:
+# 알파 128 미만(절반 넘게 비치는) 픽셀이 그림의 이 비율 이상이면 '투명 배경 그림'으로 본다.
+# 서명·도장·배경 없는 도식은 40~99%, 거의 불투명한 그림(가장자리 몇 픽셀만 투명)은 0%였다
+# (실측 2026-11, 과학전시 심사자료집 내지의 알파 있는 PNG 37장).
+SEE_THROUGH_MIN_RATIO = 0.01
+
+
+def has_see_through(img) -> bool:
+    """그림에 실제로 비치는(투명한) 부분이 있는가.
+
+    JPG에는 투명이 없어 변환하면 그 부분이 흰색으로 채워진다. 그림이 '글 앞으로' 놓여
+    글자 위에 겹쳐 있었다면(서명·도장 위의 '(인)' 등) 흰 상자가 글자를 가린다 — 이런 그림을
+    move_behind_text가 '글 뒤로' 옮긴다. 알파가 없거나 거의 불투명하면 False."""
+    if img.mode not in ("RGBA", "LA", "RGBa", "La", "PA") and "transparency" not in img.info:
+        return False
+    try:
+        alpha = img.convert("RGBA").getchannel("A")
+    except Exception:
+        return False
+    clear = sum(alpha.histogram()[:128])
+    return clear >= SEE_THROUGH_MIN_RATIO * img.width * img.height
+
+
+def convert_image_to_jpg(data: bytes, source_format: str, quality: int = 95) -> tuple[bytes, bool]:
     """이미지 바이트를 JPG 바이트로 변환합니다. (일반 래스터 전용)
+    (jpg 바이트, 투명한 부분이 있었는지)를 돌려줍니다.
 
     PIL이 못 여는 손상 파일(포토샵도 거부하지만 그림판은 여는 PNG 등)은 worker.open_raster가
     WIC — 그림판과 같은 Windows 디코더 — 로 다시 엽니다."""
     sys.path.insert(0, os.path.dirname(__file__))
     import worker
     img = worker.open_raster(data)
+    see_through = has_see_through(img)
     if img.mode != "RGB":
         img = to_rgb(img)
 
@@ -266,7 +443,7 @@ def convert_image_to_jpg(data: bytes, source_format: str, quality: int = 95) -> 
 
     buf = io.BytesIO()
     img.save(buf, "JPEG", quality=quality, dpi=dpi)
-    return buf.getvalue()
+    return buf.getvalue(), see_through
 
 
 def render_metafile_to_jpg(data: bytes, fmt: str) -> bytes:
@@ -299,11 +476,12 @@ def render_metafile_to_jpg(data: bytes, fmt: str) -> bytes:
             pass
 
 
-def image_bytes_to_jpg(data: bytes, fmt: str) -> bytes:
+def image_bytes_to_jpg(data: bytes, fmt: str) -> tuple[bytes, bool]:
     """이미지 바이트를 JPG 바이트로 변환합니다. WMF/EMF는 GDI 렌더링, 그 외는 PIL을 사용합니다.
-    HWP(OLE)·HWPX(ZIP) 두 경로가 동일하게 이 함수를 거치도록 해, 포맷 처리가 갈라지지 않게 합니다."""
+    HWP(OLE)·HWPX(ZIP) 두 경로가 동일하게 이 함수를 거치도록 해, 포맷 처리가 갈라지지 않게 합니다.
+    (jpg 바이트, 투명한 부분이 있었는지)를 돌려줍니다 — 메타파일은 판단하지 않는다(False)."""
     if fmt in ("wmf", "emf"):
-        return render_metafile_to_jpg(data, fmt)
+        return render_metafile_to_jpg(data, fmt), False
     return convert_image_to_jpg(data, fmt)
 
 
@@ -581,14 +759,17 @@ def size_adjust_hwpx(path: str, vector_origins: dict = None, page_map: PageMap =
 
 
 def read_ole_picture_info(hwp_path: str) -> dict:
-    """OLE HWP의 BodyText를 읽어 bin_id → (curW, curH, off44(L,T,R,B)) 매핑을 만든다(읽기 전용).
+    """OLE HWP의 BodyText를 읽어 스트림 번호 → (curW, curH, off44(L,T,R,B)) 매핑을 만든다(읽기 전용).
 
     - curSz(표시 크기)  : 그림 부모 Tag76(SHAPE_COMPONENT)의 offset 28/32. (실측 검증됨)
     - off44(보이는 영역): 그림 Tag85(PICTURE)의 offset 44, 이미지 고유좌표(px×75/wext×75)의 가시 rect.
-    같은 bin이 여러 그림에 다른 크기로 쓰이면(중복) 안전하게 제외한다."""
+    같은 그림이 여러 곳에 다른 크기로 쓰이면(중복) 안전하게 제외한다.
+    Tag85 offset 71은 그림 번호라 DocInfo 표로 스트림 번호에 옮긴다(연결 그림 뒤로 밀림 —
+    hwp_pagemap.bin_item_streams). 표를 못 읽으면 어느 그림의 크기인지 확신할 수 없어 빈 dict."""
     import zlib
     try:
         import olefile
+        from hwp_pagemap import bin_item_streams
     except Exception:
         return {}
     info, count = {}, {}
@@ -597,6 +778,14 @@ def read_ole_picture_info(hwp_path: str) -> dict:
     except Exception:
         return {}
     try:
+        docinfo = ole.openstream('DocInfo').read()
+        try:
+            docinfo = zlib.decompress(docinfo, -15)
+        except Exception:
+            pass
+        items = bin_item_streams(docinfo)
+        if not items:
+            return {}
         sections = sorted([n for n in ole.listdir()
                            if len(n) >= 2 and n[0] == 'BodyText' and n[1].startswith('Section')])
         for sn in sections:
@@ -628,12 +817,12 @@ def read_ole_picture_info(hwp_path: str) -> dict:
                     t76[level] = rec
                 elif tag == 85 and size >= 72:
                     try:
-                        binid = struct.unpack_from('<H', rec, 71)[0]
+                        binid = items.get(struct.unpack_from('<H', rec, 71)[0])
                         crop = struct.unpack_from('<4i', rec, 44)
                         p = t76.get(level - 1)
                         if p and len(p) >= 36:
                             cw, ch = struct.unpack_from('<2i', p, 28)
-                            if 1 <= binid <= 0xFFFF and cw > 0 and ch > 0:
+                            if binid is not None and cw > 0 and ch > 0:
                                 count[binid] = count.get(binid, 0) + 1
                                 info[binid] = (cw, ch, crop)
                     except Exception:
@@ -911,6 +1100,8 @@ class HwpProcessor:
                         "size": len(uncomp_data),
                         "used": not is_unused_hwp(page_map, name),
                         "rotated": _bin_id_of(name) in rotated_bins,
+                        # 이름과 내용이 다르면 '선택 정리'에서도 변환되므로 대상 수에 넣게 표시
+                        **mismatch_fields(name, fmt),
                     })
                 except Exception:
                     pass
@@ -956,8 +1147,9 @@ class HwpProcessor:
         # 픽셀은 아래 루프에서 돌려 두고(rotated/rot_copies), 문서 쪽 수정은 루프가 끝난 뒤
         # DocInfo·BodyText를 한꺼번에 고칠 수 있을 때만 함께 기록한다.
         rot_plan = plan_rotation_hwp(hwp_path)
-        rotated = {}               # bin id → (스트림 이름, 돌린 jpg, 압축 방식) — 제자리
-        rot_copies = {}            # (bin id, 각도) → (돌린 jpg, 압축 방식) — 새 BinData 사본
+        rotated = {}               # 스트림 번호 → (스트림 이름, 돌린 jpg, 압축 방식) — 제자리
+        rot_copies = {}            # (스트림 번호, 각도) → (돌린 jpg, 압축 방식) — 새 BinData 사본
+        see_through = set()        # 투명한 부분이 흰색이 된 그림의 스트림 번호(→ 글 뒤로)
 
         # 임시 파일 경로를 초기화
         self._current_tmp_path = None
@@ -1012,17 +1204,20 @@ class HwpProcessor:
                 # 변환한다. 사본(copies)만 필요하면 원본은 규칙대로 두고 사본만 만든다.
                 rotate_here = bool(rot_plan) and bin_id in rot_plan.in_place
                 needs_copy = bool(rot_plan) and bin_id in rot_plan.copies
-                convert_this = should_convert(fmt, mode) or rotate_here
+                # 이름(BINxxxx.png·DocInfo 확장자)과 내용이 다른 그림도 형식과 무관하게 고친다.
+                mismatch = ext_mismatch(name, fmt)
+                convert_this = should_convert(fmt, mode) or rotate_here or mismatch
                 if not convert_this and not needs_copy:
                     skipped += 1
                     continue
 
                 # 변환 (WMF/EMF는 GDI 렌더링 — 그림 자르기 여백 보존 포함, 그 외는 PIL)
-                # HWPX 경로와 동일한 image_bytes_to_jpg()를 거쳐 포맷 처리가 갈라지지 않게 한다.
+                # HWPX 경로와 동일한 to_jpg_for_mode()를 거쳐 포맷 처리가 갈라지지 않게 한다.
                 try:
-                    jpg_data = image_bytes_to_jpg(uncomp_data, fmt)
+                    jpg_data, kept, filled = to_jpg_for_mode(uncomp_data, fmt, mode, mismatch)
                 except Exception as e:
-                    emit_progress(False, name, fmt, "jpg", f"변환 실패: {e}", pages, note, approx)
+                    emit_progress(False, name, fmt, "jpg", f"변환 실패: {e}", pages, note, approx,
+                                  mismatch_fields(name, fmt))
                     skipped += 1
                     continue
 
@@ -1030,6 +1225,8 @@ class HwpProcessor:
                     skipped += 1
                     stage_rotation(bin_id, name, jpg_data, comp_type)
                     continue
+                if filled and bin_id is not None:
+                    see_through.add(bin_id)
 
                 # 사이즈 조정(변환이 끝난 JPG에만 후처리로 적용 — HWPX와 동일 규칙)
                 if size_adjust and bin_id is not None and bin_id in pic_info:
@@ -1065,7 +1262,9 @@ class HwpProcessor:
                         stream_renames.append((name, new_name))
 
                 converted += 1
-                emit_progress(True, name, fmt, "jpg", "변환 완료", pages, note, approx)
+                emit_progress(True, name, fmt, "jpg",
+                              "확장자 정정(내용은 원래 JPG)" if kept else "변환 완료",
+                              pages, note, approx, mismatch_fields(name, fmt, kept))
                 if rotate_here or needs_copy:
                     stage_rotation(bin_id, name, jpg_data, comp_type)
 
@@ -1089,7 +1288,9 @@ class HwpProcessor:
                 # 그림이 두 번 돌아간 채로 보이기 때문이다.
                 if rot_plan:
                     try:
-                        with_copies = hwp_rotation.add_bin_copies(docinfo_patched, rot_plan)
+                        with_copies = hwp_rotation.add_bin_copies(
+                            docinfo_patched, rot_plan,
+                            taken_streams={_bin_id_of(n) for n in stream_names} - {None})
                         rot_sections = self._patch_rotated_sections(storage, rot_plan)
                         docinfo_patched = with_copies
                     except Exception as e:
@@ -1115,6 +1316,16 @@ class HwpProcessor:
                         pass
             except Exception as e:
                 emit_error(f"DocInfo 패치 및 스트림 이름 변경 실패: {e}")
+
+        # 투명 배경이 흰색이 된 그림 중 '글 앞으로' 놓인 것 → '글 뒤로'(글자를 가리지 않게).
+        # 회전 기록까지 끝난 구역을 다시 읽어 고치므로 두 수정이 서로 덮어쓰지 않는다.
+        moved = {}
+        if see_through:
+            try:
+                moved = self._move_behind_text(storage, see_through)
+            except Exception as e:
+                moved = {}
+                emit_error(f"투명 배경 그림 배치 조정 실패 — 배치는 그대로 둡니다: {e}")
 
         # OLE 커밋
         try:
@@ -1142,12 +1353,13 @@ class HwpProcessor:
 
         emit_approx(page_map)
         emit_unused(unused_names)
+        stream_of = {_bin_id_of(n): n for n in stream_names}
+        page_fields_of = lambda n: _page_fields(lookup_hwp(page_map, n),           # noqa: E731
+                                                note_hwp(page_map, n),
+                                                is_approx_hwp(page_map, n))
         if rot_plan is not None:
-            stream_of = {_bin_id_of(n): n for n in stream_names}
-            emit_rotation(rot_plan, bool(rot_sections), stream_of,
-                          lambda n: _page_fields(lookup_hwp(page_map, n),
-                                                 note_hwp(page_map, n),
-                                                 is_approx_hwp(page_map, n)))
+            emit_rotation(rot_plan, bool(rot_sections), stream_of, page_fields_of)
+        emit_wrap({stream_of.get(k, str(k)): n for k, n in moved.items()}, page_fields_of)
         emit_done(converted, skipped)
         if size_adjust:
             _print_json({"event": "sizeDone", "adjusted": size_adjusted, "skipped": size_skipped})
@@ -1178,6 +1390,31 @@ class HwpProcessor:
                 pass
             return None
 
+    def _move_behind_text(self, storage, streams: set) -> dict:
+        """모든 구역에서 streams(스트림 번호)를 쓰는 '글 앞으로' 그림을 '글 뒤로' 옮겨 기록합니다.
+        {스트림 번호: 옮긴 개수}. 그림 번호 → 스트림 번호 표는 지금의 DocInfo로 만든다."""
+        docinfo, _comp = self._decompress(self._read_stream(storage, "DocInfo"))
+        items = bin_item_streams(docinfo)
+        if not items:
+            return {}
+        moved: dict = {}
+        body = storage.OpenStorage("BodyText", None,
+                                   self.STGM_READWRITE | self.STGM_SHARE_EXCLUSIVE, None, 0)
+        try:
+            for section in self._enum_bindata_streams(body):
+                if not section.startswith("Section"):
+                    continue
+                data, comp_type = self._decompress(self._read_stream(body, section))
+                patched, counts = move_behind_text(data, items, streams)
+                if counts:
+                    self._write_stream(body, section, self._compress(patched, comp_type))
+                    for key, n in counts.items():
+                        moved[key] = moved.get(key, 0) + n
+            body.Commit(0)
+        finally:
+            del body
+        return moved
+
     def _patch_rotated_sections(self, storage, rot_plan) -> dict:
         """바로 세울 그림이 있는 구역을 메모리에서 고쳐 {구역 이름: 압축된 바이트}로 돌려줍니다."""
         out = {}
@@ -1186,7 +1423,8 @@ class HwpProcessor:
         try:
             for section, targets in rot_plan.targets().items():
                 data, comp_type = self._decompress(self._read_stream(body, section))
-                out[section] = self._compress(hwp_rotation.patch_section(data, targets), comp_type)
+                out[section] = self._compress(
+                    hwp_rotation.patch_section(data, targets, rot_plan.bin_items), comp_type)
         finally:
             del body
         return out
@@ -1194,10 +1432,10 @@ class HwpProcessor:
     def _write_rotation(self, storage, bindata, rot_plan, sections: dict,
                         rotated: dict, rot_copies: dict):
         """돌린 픽셀(제자리·사본)과 고친 구역을 기록합니다. DocInfo는 호출 전에 이미 기록됨."""
-        for (bin_id, angle), new_id in rot_plan.new_ids.items():
-            jpg_data, comp_type = rot_copies[(bin_id, angle)]
+        for copy_key, stream_id in rot_plan.copy_streams.items():
+            jpg_data, comp_type = rot_copies[copy_key]
             stream = bindata.CreateStream(
-                f"BIN{new_id:04X}.jpg",
+                f"BIN{stream_id:04X}.jpg",
                 self.STGM_READWRITE | self.STGM_SHARE_EXCLUSIVE | self.STGM_CREATE, 0, 0)
             stream.Write(self._compress(jpg_data, comp_type))
             del stream
@@ -1232,12 +1470,23 @@ class HwpxProcessor:
 
     def _get_format_from_name(self, filename: str) -> str:
         """파일명에서 확장자 기반 형식을 반환합니다."""
-        ext = Path(filename).suffix.lower().lstrip(".")
-        if ext in ("jpg", "jpeg"):
-            return "jpg"
-        if ext in ("tif", "tiff"):
-            return "tif"
-        return ext if ext else "unknown"
+        return name_ext(filename) or "unknown"
+
+    def _manifest_ids(self, zf: zipfile.ZipFile) -> dict:
+        """매니페스트(content.hpf) → {그림 ZIP 경로(소문자): 항목 id}. 구역 XML의 그림은
+        binaryItemIDRef로 이 id를 가리킨다. 못 읽으면 빈 dict."""
+        try:
+            hpf = next(n for n in zf.namelist() if n.lower().endswith(".hpf"))
+            text = zf.read(hpf).decode("utf-8", errors="replace")
+        except Exception:
+            return {}
+        ids = {}
+        for tag in re.findall(r"<(?:\w+:)?item\b[^>]*>", text):
+            item_id = re.search(r'\bid="([^"]+)"', tag)
+            href = re.search(r'\bhref="([^"]+)"', tag)
+            if item_id and href:
+                ids[href.group(1).lower()] = item_id.group(1)
+        return ids
 
     def scan(self, hwpx_path: str) -> list:
         """HWPX 파일 내 이미지 목록을 반환합니다. used=False면 변환에서 제외될 그림입니다."""
@@ -1260,6 +1509,7 @@ class HwpxProcessor:
                         "size": len(data),
                         "used": not is_unused_hwpx(page_map, entry),
                         "rotated": entry in rotated_entries,
+                        **mismatch_fields(entry, fmt),
                     })
         except Exception as e:
             emit_error(f"HWPX 스캔 실패: {e}")
@@ -1292,10 +1542,12 @@ class HwpxProcessor:
         ref_of = {entry: ref for ref, entry in rot_plan.entries.items()} if rot_plan else {}
         rotated = {}               # ref → 돌린 jpg (제자리)
         rot_copies = {}            # (ref, 각도) → 돌린 jpg (새 그림 사본)
+        see_through = set()        # 투명한 부분이 흰색이 된 그림의 ZIP 경로(→ 글 뒤로)
 
         with zipfile.ZipFile(output_path, "r") as zf:
             entries = sort_by_page(self._find_bindata_entries(zf),
                                    lambda e: lookup_hwpx(self.page_map, e))
+            item_ids = self._manifest_ids(zf)
 
             for entry in entries:
                 data = zf.read(entry)
@@ -1316,15 +1568,18 @@ class HwpxProcessor:
                 ref = ref_of.get(entry)
                 rotate_here = bool(rot_plan) and ref in rot_plan.in_place
                 needs_copy = bool(rot_plan) and ref in rot_plan.copies
-                convert_this = should_convert(fmt, mode) or rotate_here
+                # 이름(href)과 내용이 다른 그림도 형식과 무관하게 고친다(OLE와 같은 규칙).
+                mismatch = ext_mismatch(entry, fmt)
+                convert_this = should_convert(fmt, mode) or rotate_here or mismatch
                 if not convert_this and not needs_copy:
                     skipped += 1
                     continue
 
                 try:
-                    jpg_data = image_bytes_to_jpg(data, fmt)
+                    jpg_data, kept, filled = to_jpg_for_mode(data, fmt, mode, mismatch)
                 except Exception as e:
-                    emit_progress(False, original_name, fmt, "jpg", f"변환 실패: {e}", pages, note, approx)
+                    emit_progress(False, original_name, fmt, "jpg", f"변환 실패: {e}", pages, note, approx,
+                                  mismatch_fields(entry, fmt))
                     skipped += 1
                     continue
 
@@ -1347,9 +1602,13 @@ class HwpxProcessor:
                 name_map[original_name] = f"{stem}.jpg"
                 if fmt in ("wmf", "emf"):
                     self.vector_origins[new_entry] = (fmt, data)
+                if filled and entry.lower() in item_ids:
+                    see_through.add(item_ids[entry.lower()])
 
                 converted += 1
-                emit_progress(True, original_name, fmt, "jpg", "변환 완료", pages, note, approx)
+                emit_progress(True, original_name, fmt, "jpg",
+                              "확장자 정정(내용은 원래 JPG)" if kept else "변환 완료",
+                              pages, note, approx, mismatch_fields(entry, fmt, kept))
 
         emit_approx(self.page_map)
         emit_unused(unused_names)
@@ -1396,6 +1655,7 @@ class HwpxProcessor:
         # 새 ZIP 생성 (임시 파일)
         tmp_fd, tmp_path = tempfile.mkstemp(suffix=".hwpx")
         os.close(tmp_fd)
+        moved = {}                 # binaryItemIDRef → '글 뒤로' 옮긴 개수
 
         try:
             with zipfile.ZipFile(output_path, "r") as zf_in, \
@@ -1420,6 +1680,12 @@ class HwpxProcessor:
                                 text = data.decode("utf-8", errors="replace")
                             for old_name, new_name_str in name_map.items():
                                 text = text.replace(old_name, new_name_str)
+                            # 투명 배경이 흰색이 된 그림: '글 앞으로' → '글 뒤로'(OLE와 같은 규칙)
+                            if see_through and re.search(r"(^|/)section\d+\.xml$",
+                                                         info.filename, re.I):
+                                text, counts = move_behind_text_hwpx(text, see_through)
+                                for ref, n in counts.items():
+                                    moved[ref] = moved.get(ref, 0) + n
                             # OPF 매니페스트(content.hpf): 변환된 이미지의 media-type을 image/jpeg로 교체.
                             # href만 .jpg로 바뀌고 media-type이 image/wmf로 남으면 한글이 여전히
                             # wmf로 인식한다(OLE 경로에서 DocInfo 확장자를 패치하는 것과 같은 처리).
@@ -1454,6 +1720,12 @@ class HwpxProcessor:
             # 임시 파일을 출력 경로로 이동
             shutil.move(tmp_path, output_path)
 
+            entry_of = {ref: entry for entry, ref in item_ids.items()}
+            emit_wrap({Path(entry_of.get(ref, ref)).name: n for ref, n in moved.items()},
+                      lambda n: _page_fields(lookup_hwpx(self.page_map, n),
+                                             note_hwpx(self.page_map, n),
+                                             is_approx_hwpx(self.page_map, n)))
+
         except Exception as e:
             emit_error(f"HWPX 재패키징 실패: {e}")
             # 임시 파일 정리
@@ -1480,8 +1752,10 @@ def _print_json(data: dict):
     sys.stdout.buffer.flush()
 
 def emit_progress(success: bool, name: str, from_fmt: str, to_fmt: str, message: str,
-                  pages: list = None, note: str = None, approx: bool = False):
-    """진행 상황 1건. pages는 그림이 놓인 쪽 목록(문서 순서) — 없으면 필드를 생략한다."""
+                  pages: list = None, note: str = None, approx: bool = False,
+                  extra: dict = None):
+    """진행 상황 1건. pages는 그림이 놓인 쪽 목록(문서 순서) — 없으면 필드를 생략한다.
+    from은 실제 내용의 형식이다. extra는 추가 필드(확장자 정정의 nameExt/kept 등)."""
     data = {
         "event": "progress",
         "success": success,
@@ -1491,7 +1765,20 @@ def emit_progress(success: bool, name: str, from_fmt: str, to_fmt: str, message:
         "message": message,
     }
     data.update(_page_fields(pages, note, approx))
+    if extra:
+        data.update(extra)
     _print_json(data)
+
+
+def mismatch_fields(name: str, fmt: str, kept: bool = False) -> dict:
+    """확장자 정정 그림의 NDJSON 필드. nameExt = 이름의 확장자(실제 내용은 from/format),
+    kept = 내용이 이미 JPEG라 다시 인코딩하지 않고 이름만 바꿈."""
+    if not ext_mismatch(name, fmt):
+        return {}
+    fields = {"nameExt": name_ext(name)}
+    if kept:
+        fields["kept"] = True
+    return fields
 
 
 def _page_fields(pages: list, note: str = None, approx: bool = False) -> dict:
@@ -1556,6 +1843,16 @@ def emit_rotation(plan, applied: bool, name_of: dict, page_fields_of):
         kept += 1
     if fixed or kept:
         _print_json({"event": "rotateDone", "fixed": fixed, "kept": kept})
+
+
+def emit_wrap(moved: dict, page_fields_of):
+    """'글 앞으로' → '글 뒤로' 옮긴 투명 배경 그림을 그림마다 한 줄씩 알립니다.
+    moved = 그림 이름 → 옮긴 개수(같은 그림이 여러 곳에 쓰였으면 2 이상)."""
+    for name, count in moved.items():
+        where = f" {count}곳" if count > 1 else ""
+        _print_json({"event": "wrap", "name": name,
+                     "message": f"투명 배경 → 글 뒤로{where} (흰 바탕이 글자를 가리지 않게)",
+                     **page_fields_of(name)})
 
 
 def emit_done(total_converted: int, total_skipped: int):

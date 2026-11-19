@@ -46,8 +46,13 @@ INLINE_CTRL_CODES = {4, 5, 6, 7, 8, 9, 19, 20}
 CTRL_CHAR_WIDTH = 8
 
 # DocInfo 레코드 태그 (본문 밖 그림 참조를 찾기 위한 것)
+TAG_BIN_DATA = 18
 TAG_BORDER_FILL = 20
 TAG_BULLET = 24
+
+# BIN_DATA 속성 하위 4비트: 0=연결(문서 밖 파일, 스트림 없음), 1=임베딩, 2=스토리지(OLE)
+BIN_TYPE_MASK = 0x000F
+BIN_TYPE_LINK = 0
 
 # 쪽을 못 매기는 쓰임새(로그 칩에 그대로 표시된다)
 REASON_FILL = "채우기"        # 문단·표의 그림 채우기(배경)
@@ -107,6 +112,32 @@ def _iter_records(data: bytes):
         pos += hdr + size
 
 
+def bin_item_streams(docinfo: bytes) -> dict:
+    """압축을 푼 DocInfo → {그림 번호(BinItem ID): 스트림 번호(BINxxxx의 xxxx)}.
+
+    ⚠ 둘은 같은 번호가 아니다. 본문 그림(PICTURE offset 71)·그림 채우기·글머리표가 적는
+    '그림 번호'는 DocInfo BIN_DATA 레코드의 **등장 순서(1부터)** 이고, 실제 데이터가 든
+    스트림 이름은 그 레코드 안의 binId 필드다. 보통은 같지만 어긋난 문서가 드물지 않다
+    (실측 2026-11, `D:\\작업방` HWP 1,660개 중 53개(약 3%)에서 하나 이상 어긋남):
+      * **연결 그림**(문서에 포함하지 않은 그림)은 레코드만 있고 binId·스트림이 없어, 그 뒤의
+        그림 번호가 하나씩 밀린다(과학전시 심사자료집 내지: 622번째가 연결 그림 → 뒤의 150개가
+        '그림 번호 = 스트림 번호 + 1'). 같다고 가정한 탓에 회전 그림을 바로 세울 때 옆 그림의
+        픽셀을 돌려 그림 8장이 옆으로 누웠다.
+      * 레코드 **순서 자체가 뒤섞인** 문서도 있다(결산보고서: 1번 레코드 → BIN0007, 2번 →
+        BIN0001 …). 회전 사본을 엉뚱한 그림으로 만들어 그 자리가 빈 상자가 됐다.
+
+    연결 그림은 스트림이 없으므로 결과에 넣지 않는다. 읽지 못하면 빈 dict."""
+    items = {}
+    index = 0
+    for tag, _level, rec in _iter_records(docinfo):
+        if tag != TAG_BIN_DATA:
+            continue
+        index += 1
+        if len(rec) >= 4 and (struct.unpack_from("<H", rec, 0)[0] & BIN_TYPE_MASK) != BIN_TYPE_LINK:
+            items[index] = struct.unpack_from("<H", rec, 2)[0]
+    return items
+
+
 def _starts_new_page(vert, height, colstart, prev) -> bool:
     """이 줄이 새 쪽의 첫 줄인가. prev는 (vert, height, colstart) 또는 None.
 
@@ -162,6 +193,9 @@ class PageMap:
         self.approx_from = None     # 이 물리 쪽부터는 쪽 번호가 근사치(아래 설명 참고)
         self.anchors: dict = {}     # 키 → [(문단번호, 글자위치)] — 한글에 정확한 쪽을 물을 좌표
         self.exact: bool = False    # 한글이 직접 알려준 쪽으로 채워졌는가
+        # OLE: 스트림 번호 → (그림 번호, ...). 키는 문서가 적는 그림 번호라, 스트림 이름으로
+        # 찾을 때 이 표를 거친다(bin_item_streams 참고). 비어 있으면 같은 번호로 본다.
+        self.stream_items: dict = {}
 
     def lookup(self, *keys):
         for key in keys:
@@ -463,9 +497,13 @@ def _collect_docinfo_refs(ole, page_map: PageMap, fill_pages: dict = None,
         except Exception:
             data = raw
 
+    # 스트림 이름으로 찾을 때 쓸 '스트림 번호 → 그림 번호' 표(연결 그림 뒤로 번호가 밀린다).
+    for item, stream in bin_item_streams(data).items():
+        page_map.stream_items[stream] = page_map.stream_items.get(stream, ()) + (item,)
+
     fill_pages = fill_pages or {}
     shape_pages = shape_pages or {}
-    image_fills: dict = {}          # 테두리/채우기 ID(1부터) → BinData id
+    image_fills: dict = {}          # 테두리/채우기 ID(1부터) → 그림 번호(BinItem ID)
     shape_to_fill: dict = {}        # 문단 모양 ID(0부터) → 테두리/채우기 ID
     fill_index = 0
     shape_index = -1
@@ -692,10 +730,19 @@ def _hwpx_collect_images(para, segs: list, page_map: dict, id_to_file: dict,
 # 조회 헬퍼
 # ─────────────────────────────────────────
 
-def _hwp_keys(stream_name: str) -> tuple:
-    """'BIN0003.png' → (bin id,). 이름 형식이 아니면 빈 튜플."""
+def _hwp_keys(page_map: PageMap, stream_name: str) -> tuple:
+    """'BIN0003.png' → 이 스트림을 가리키는 그림 번호들. 이름 형식이 아니면 빈 튜플.
+
+    페이지 맵의 키는 문서가 적는 그림 번호(BinItem ID)라서 DocInfo 표로 옮긴다. 표에 없는
+    스트림(어느 레코드도 가리키지 않음)은 빈 튜플 — 조회는 None, 미사용 판정은 '사용 중'으로
+    떨어진다. 표 자체가 없으면(DocInfo를 못 읽음) 예전처럼 같은 번호로 본다."""
     m = re.match(r"^BIN([0-9A-Fa-f]{4})\.", stream_name)
-    return (int(m.group(1), 16),) if m else ()
+    if not m:
+        return ()
+    stream = int(m.group(1), 16)
+    if page_map.stream_items:
+        return page_map.stream_items.get(stream, ())
+    return (stream,)
 
 
 def _hwpx_keys(entry_name: str) -> tuple:
@@ -706,7 +753,7 @@ def _hwpx_keys(entry_name: str) -> tuple:
 
 def lookup_hwp(page_map: PageMap, stream_name: str):
     """'BIN0003.png' → [(인쇄 번호, 물리 쪽), ...] (없으면 None)."""
-    return page_map.lookup(*_hwp_keys(stream_name))
+    return page_map.lookup(*_hwp_keys(page_map, stream_name))
 
 
 def lookup_hwpx(page_map: PageMap, entry_name: str):
@@ -716,7 +763,7 @@ def lookup_hwpx(page_map: PageMap, entry_name: str):
 
 def note_hwp(page_map: PageMap, stream_name: str):
     """쪽은 없지만 쓰이고 있는 그림의 쓰임새('채우기' 등). 아니면 None."""
-    return page_map.note(*_hwp_keys(stream_name))
+    return page_map.note(*_hwp_keys(page_map, stream_name))
 
 
 def note_hwpx(page_map: PageMap, entry_name: str):
@@ -726,7 +773,7 @@ def note_hwpx(page_map: PageMap, entry_name: str):
 
 def is_approx_hwp(page_map: PageMap, stream_name: str) -> bool:
     """이 그림의 쪽 번호가 근사치인가(여러 쪽에 걸친 표 뒤쪽)."""
-    return page_map.is_approx(page_map.lookup(*_hwp_keys(stream_name)))
+    return page_map.is_approx(page_map.lookup(*_hwp_keys(page_map, stream_name)))
 
 
 def is_approx_hwpx(page_map: PageMap, entry_name: str) -> bool:
@@ -736,7 +783,7 @@ def is_approx_hwpx(page_map: PageMap, entry_name: str) -> bool:
 
 def is_unused_hwp(page_map: PageMap, stream_name: str) -> bool:
     """이 BinData 스트림이 문서 어디에서도 안 쓰이는가(= 변환에서 빼도 되는가)."""
-    keys = _hwp_keys(stream_name)
+    keys = _hwp_keys(page_map, stream_name)
     return bool(keys) and page_map.is_unused(*keys)
 
 
